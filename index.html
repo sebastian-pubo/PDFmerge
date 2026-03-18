@@ -280,7 +280,7 @@
         <div class="pill">Ignores location from PDF 2</div>
         <div class="pill">Ignores total room counters</div>
         <div class="pill">Matches PDF 2 rooms to PDF 1 rooms</div>
-        <div class="pill">Handles duplicate bedrooms by order</div>
+        <div class="pill">Handles duplicate rooms by order</div>
         <div class="pill">Creates a clean summary PDF</div>
         <p class="mini">This is a first-pass parser for the sample structure you supplied. If one of your future PDFs changes layout or wording, keep this version as the base and extend the parser rules rather than changing the whole app.</p>
       </div>
@@ -466,6 +466,7 @@
     }
 
 
+
     function parsePdf1(pdf) {
       const property = {
         source_file: pdf.name,
@@ -486,71 +487,52 @@
       property.floors = (pdf.fullText.match(/FLOORS:\s*(\d+)/i) || [null, null])[1] || null;
 
       const rooms = [];
-      const duplicateCounter = {};
+      const allText = pdf.pages.map((page) => page.text).join('\n\n');
+      const geometryRegex = /▼\s*([^\n\/]+)\s*\n([A-Za-z ]+Floor)\s*\nWIDTH:\s*([\d.]+)\s*m\s*•\s*LENGTH:\s*([\d.]+)\s*m\s*•\s*CEILING HEIGHT:\s*([\d.]+)\s*m\s*\nAREA:\s*([\d.]+)\s*m²\s*•\s*PERIMETER:\s*([\d.]+)\s*m/gi;
+      const geometryMatches = Array.from(allText.matchAll(geometryRegex));
 
-      function findLineIndex(lines, predicate, startIdx = 0) {
-        for (let i = startIdx; i < lines.length; i += 1) {
-          if (predicate((lines[i] || '').trim(), i)) return i;
-        }
-        return -1;
-      }
+      const totalsByBaseName = {};
+      geometryMatches.forEach((match) => {
+        const baseName = normalizeSpaces(match[1]);
+        totalsByBaseName[baseName] = (totalsByBaseName[baseName] || 0) + 1;
+      });
 
-      for (const page of pdf.pages) {
-        const lines = page.lines.map((line) => normalizeSpaces(line)).filter(Boolean);
-        const headerIdx = findLineIndex(lines, (line) => /^▼\s+.+$/i.test(line) && !/\/.+floor/i.test(line));
-        if (headerIdx < 0) continue;
+      const seenByBaseName = {};
+      geometryMatches.forEach((match, idx) => {
+        const baseName = normalizeSpaces(match[1]);
+        const floor = normalizeSpaces(match[2]);
+        const width = maybeNumber(match[3]);
+        const length = maybeNumber(match[4]);
+        const ceilingHeight = maybeNumber(match[5]);
+        const area = maybeNumber(match[6]);
+        const perimeter = maybeNumber(match[7]);
 
-        const baseName = normalizeSpaces(lines[headerIdx].replace(/^▼\s+/, ''));
-        const floorIdx = findLineIndex(lines, (line, i) => i > headerIdx && /floor$/i.test(line));
-        const dimsIdx = findLineIndex(lines, (line) => /WIDTH:\s*[\d.]+\s*m/i.test(line) && /LENGTH:\s*[\d.]+\s*m/i.test(line));
-        const areaIdx = findLineIndex(lines, (line) => /AREA:\s*[\d.]+\s*m²/i.test(line) && /PERIMETER:\s*[\d.]+\s*m/i.test(line));
-        const detailHeaderIdx = findLineIndex(lines, (line) => new RegExp(`^▼\\s*${escapeRegExp(baseName)}\\s*\\/\\s*.+floor$`, 'i').test(line));
+        const sectionStart = match.index ?? 0;
+        const sectionEnd = idx + 1 < geometryMatches.length ? (geometryMatches[idx + 1].index ?? allText.length) : allText.length;
+        const sectionText = allText.slice(sectionStart, sectionEnd);
 
-        if (floorIdx < 0 || dimsIdx < 0 || areaIdx < 0 || detailHeaderIdx < 0) continue;
+        seenByBaseName[baseName] = (seenByBaseName[baseName] || 0) + 1;
+        const displayName = totalsByBaseName[baseName] > 1
+          ? `${baseName} ${seenByBaseName[baseName]}`
+          : baseName;
 
-        duplicateCounter[baseName] = (duplicateCounter[baseName] || 0) + 1;
-        const displayName = uniqueRoomLabel(baseName, duplicateCounter[baseName]);
-        const floor = normalizeSpaces(lines[floorIdx]);
+        const detailRegex = new RegExp(`▼\\s*${escapeRegExp(baseName)}\\s*\\/\\s*${escapeRegExp(floor)}([\\s\\S]*)`, 'i');
+        const detailMatch = sectionText.match(detailRegex);
+        const detailText = detailMatch ? detailMatch[1] : sectionText;
 
-        const dimsLine = lines[dimsIdx];
-        const areaLine = lines[areaIdx];
-        const width = maybeNumber((dimsLine.match(/WIDTH:\s*([\d.]+)\s*m/i) || [null, null])[1]);
-        const length = maybeNumber((dimsLine.match(/LENGTH:\s*([\d.]+)\s*m/i) || [null, null])[1]);
-        const ceilingHeight = maybeNumber((dimsLine.match(/CEILING HEIGHT:\s*([\d.]+)\s*m/i) || [null, null])[1]);
-        const area = maybeNumber((areaLine.match(/AREA:\s*([\d.]+)\s*m²/i) || [null, null])[1]);
-        const perimeter = maybeNumber((areaLine.match(/PERIMETER:\s*([\d.]+)\s*m/i) || [null, null])[1]);
-
-        const detailsLines = lines.slice(detailHeaderIdx + 1);
-        let notes = null;
-        const notesIdx = findLineIndex(detailsLines, (line) => /^Notes$/i.test(line));
-        if (notesIdx >= 0) {
-          const noteParts = [];
-          for (let i = notesIdx + 1; i < detailsLines.length; i += 1) {
-            const line = detailsLines[i];
-            if (/^\d+\s+[A-Z ]+$/.test(line) || /^THIS FLOOR PLAN/i.test(line)) break;
-            noteParts.push(line);
-          }
-          notes = noteParts.length ? normalizeSpaces(noteParts.join(' ')) : null;
-        }
+        const notesMatch = detailText.match(/Notes\s*\n([\s\S]*?)(?=\n\d+\s*\n[A-Z][A-Z ]+\s*\nDimensions|\nTHIS FLOOR PLAN|\nPage \d+\/\d+|$)/i);
+        const notes = notesMatch ? normalizeSpaces(notesMatch[1]) : null;
 
         const openings = [];
-        for (let i = 0; i < detailsLines.length; i += 1) {
-          const line = detailsLines[i];
-          const openingHeader = line.match(/^(\d+)\s+([A-Z ]+)$/);
-          if (!openingHeader) continue;
-
-          const dimensionLine = detailsLines[i + 2] || '';
-          const distanceValueLine = detailsLines[i + 4] || '';
-          const dimsMatch = dimensionLine.match(/([\d.]+)\s*m\s*x\s*([\d.]+)\s*m/i);
-          const distanceMatch = distanceValueLine.match(/([\d.]+)\s*m/i);
-          if (!dimsMatch) continue;
-
+        const openingRegex = /(?:^|\n)(\d+)\s*\n([A-Z][A-Z ]+)\s*\nDimensions\s*\n([\d.]+)\s*m\s*x\s*([\d.]+)\s*m\s*\(Width x Height\)\s*\nDistance to Floor\s*\n([\d.]+)\s*m/gi;
+        let openingMatch;
+        while ((openingMatch = openingRegex.exec(detailText)) !== null) {
           openings.push({
-            index: Number(openingHeader[1]),
-            type: titleCase(normalizeSpaces(openingHeader[2])),
-            width_m: Number(dimsMatch[1]),
-            height_m: Number(dimsMatch[2]),
-            distance_to_floor_m: distanceMatch ? Number(distanceMatch[1]) : null
+            index: Number(openingMatch[1]),
+            type: titleCase(normalizeSpaces(openingMatch[2])),
+            width_m: Number(openingMatch[3]),
+            height_m: Number(openingMatch[4]),
+            distance_to_floor_m: Number(openingMatch[5])
           });
         }
 
@@ -569,14 +551,16 @@
           match_key: slugifyRoomName(displayName),
           base_match_key: slugifyRoomName(baseName)
         });
-      }
+      });
 
       return { property, rooms };
     }
 
+
     function parsePropertyDetailsPdf2(pdf) {
       const introText = pdf.pages.slice(0, 3).map((p) => p.text).join('\n\n');
       const lines = normalizeSpaces(introText).split('\n').map((line) => line.trim()).filter(Boolean);
+      const floorTypeRegex = /Floor Type(?:\s*\(.*?\))?\s*\n([^\n]+)/i;
       return {
         source_file: pdf.name,
         property_address: findField(lines, 'Property Address') || null,
@@ -592,7 +576,7 @@
         cavity_wall_depth_mm: findField(lines, 'Cavity wall depth (in mm)') || null,
         insulation_present: findField(lines, 'Is insulation present?') || null,
         insulation_type: findField(lines, 'Insulation type') || null,
-        floor_type: findField(lines, 'Floor Type (Picture of airbricks if suspended timber is selected)') || null,
+        floor_type: (introText.match(floorTypeRegex) || [null, null])[1] || findField(lines, 'Floor Type') || null,
         material_type: findField(lines, 'Material Type') || null
       };
     }
