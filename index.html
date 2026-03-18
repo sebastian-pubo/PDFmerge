@@ -465,6 +465,7 @@
       };
     }
 
+
     function parsePdf1(pdf) {
       const property = {
         source_file: pdf.name,
@@ -487,33 +488,69 @@
       const rooms = [];
       const duplicateCounter = {};
 
-      for (const page of pdf.pages) {
-        const roomMatch = page.text.match(/▼\s*([^\n\/]+)\n([^\n]+Floor)\nWIDTH:\s*([\d.]+)\s*m\s*•\s*LENGTH:\s*([\d.]+)\s*m\s*•\s*CEILING HEIGHT:\s*([\d.]+)\s*m\nAREA:\s*([\d.]+)\s*m²\s*•\s*PERIMETER:\s*([\d.]+)\s*m/i);
-        if (!roomMatch) continue;
+      function findLineIndex(lines, predicate, startIdx = 0) {
+        for (let i = startIdx; i < lines.length; i += 1) {
+          if (predicate((lines[i] || '').trim(), i)) return i;
+        }
+        return -1;
+      }
 
-        const baseName = normalizeSpaces(roomMatch[1]);
+      for (const page of pdf.pages) {
+        const lines = page.lines.map((line) => normalizeSpaces(line)).filter(Boolean);
+        const headerIdx = findLineIndex(lines, (line) => /^▼\s+.+$/i.test(line) && !/\/.+floor/i.test(line));
+        if (headerIdx < 0) continue;
+
+        const baseName = normalizeSpaces(lines[headerIdx].replace(/^▼\s+/, ''));
+        const floorIdx = findLineIndex(lines, (line, i) => i > headerIdx && /floor$/i.test(line));
+        const dimsIdx = findLineIndex(lines, (line) => /WIDTH:\s*[\d.]+\s*m/i.test(line) && /LENGTH:\s*[\d.]+\s*m/i.test(line));
+        const areaIdx = findLineIndex(lines, (line) => /AREA:\s*[\d.]+\s*m²/i.test(line) && /PERIMETER:\s*[\d.]+\s*m/i.test(line));
+        const detailHeaderIdx = findLineIndex(lines, (line) => new RegExp(`^▼\\s*${escapeRegExp(baseName)}\\s*\\/\\s*.+floor$`, 'i').test(line));
+
+        if (floorIdx < 0 || dimsIdx < 0 || areaIdx < 0 || detailHeaderIdx < 0) continue;
+
         duplicateCounter[baseName] = (duplicateCounter[baseName] || 0) + 1;
         const displayName = uniqueRoomLabel(baseName, duplicateCounter[baseName]);
-        const floor = normalizeSpaces(roomMatch[2]);
-        const detailStartMatch = page.text.match(new RegExp(`▼\\s*${escapeRegExp(baseName)}\\/${escapeRegExp(floor)}\\n([\\s\\S]*?)THIS FLOOR PLAN`, 'i'));
-        const detailsText = detailStartMatch ? detailStartMatch[1].trim() : '';
+        const floor = normalizeSpaces(lines[floorIdx]);
 
+        const dimsLine = lines[dimsIdx];
+        const areaLine = lines[areaIdx];
+        const width = maybeNumber((dimsLine.match(/WIDTH:\s*([\d.]+)\s*m/i) || [null, null])[1]);
+        const length = maybeNumber((dimsLine.match(/LENGTH:\s*([\d.]+)\s*m/i) || [null, null])[1]);
+        const ceilingHeight = maybeNumber((dimsLine.match(/CEILING HEIGHT:\s*([\d.]+)\s*m/i) || [null, null])[1]);
+        const area = maybeNumber((areaLine.match(/AREA:\s*([\d.]+)\s*m²/i) || [null, null])[1]);
+        const perimeter = maybeNumber((areaLine.match(/PERIMETER:\s*([\d.]+)\s*m/i) || [null, null])[1]);
+
+        const detailsLines = lines.slice(detailHeaderIdx + 1);
         let notes = null;
-        if (/^Notes\n/i.test(detailsText)) {
-          const notesMatch = detailsText.match(/^Notes\n([\s\S]*?)(?=\n\d+\s+[A-Z ]+\nDimensions|$)/i);
-          notes = notesMatch ? normalizeSpaces(notesMatch[1]) : null;
+        const notesIdx = findLineIndex(detailsLines, (line) => /^Notes$/i.test(line));
+        if (notesIdx >= 0) {
+          const noteParts = [];
+          for (let i = notesIdx + 1; i < detailsLines.length; i += 1) {
+            const line = detailsLines[i];
+            if (/^\d+\s+[A-Z ]+$/.test(line) || /^THIS FLOOR PLAN/i.test(line)) break;
+            noteParts.push(line);
+          }
+          notes = noteParts.length ? normalizeSpaces(noteParts.join(' ')) : null;
         }
 
-        const openingRegex = /(\d+)\s+([A-Z ]+)\nDimensions\n([\d.]+)\s*m\s*x\s*([\d.]+)\s*m\s*\(Width x Height\)\nDistance to Floor\n([\d.]+)\s*m/gi;
         const openings = [];
-        let openingMatch;
-        while ((openingMatch = openingRegex.exec(detailsText)) !== null) {
+        for (let i = 0; i < detailsLines.length; i += 1) {
+          const line = detailsLines[i];
+          const openingHeader = line.match(/^(\d+)\s+([A-Z ]+)$/);
+          if (!openingHeader) continue;
+
+          const dimensionLine = detailsLines[i + 2] || '';
+          const distanceValueLine = detailsLines[i + 4] || '';
+          const dimsMatch = dimensionLine.match(/([\d.]+)\s*m\s*x\s*([\d.]+)\s*m/i);
+          const distanceMatch = distanceValueLine.match(/([\d.]+)\s*m/i);
+          if (!dimsMatch) continue;
+
           openings.push({
-            index: Number(openingMatch[1]),
-            type: titleCase(normalizeSpaces(openingMatch[2])),
-            width_m: Number(openingMatch[3]),
-            height_m: Number(openingMatch[4]),
-            distance_to_floor_m: Number(openingMatch[5])
+            index: Number(openingHeader[1]),
+            type: titleCase(normalizeSpaces(openingHeader[2])),
+            width_m: Number(dimsMatch[1]),
+            height_m: Number(dimsMatch[2]),
+            distance_to_floor_m: distanceMatch ? Number(distanceMatch[1]) : null
           });
         }
 
@@ -522,11 +559,11 @@
           base_name: baseName,
           room_name: displayName,
           floor,
-          width_m: Number(roomMatch[3]),
-          length_m: Number(roomMatch[4]),
-          ceiling_height_m: Number(roomMatch[5]),
-          area_m2: Number(roomMatch[6]),
-          perimeter_m: Number(roomMatch[7]),
+          width_m: width,
+          length_m: length,
+          ceiling_height_m: ceilingHeight,
+          area_m2: area,
+          perimeter_m: perimeter,
           notes,
           openings,
           match_key: slugifyRoomName(displayName),
@@ -608,6 +645,32 @@
       return room;
     }
 
+
+    function roomHasUsefulData(room) {
+      return [
+        room.is_ensuite,
+        room.bedroom_type,
+        room.overall_condition,
+        room.defects,
+        room.has_windows,
+        room.window_condition,
+        room.has_trickle_vents,
+        room.trickle_vent_size_mm2,
+        room.windows_openable,
+        room.opening_type,
+        room.effective_opening_area_width,
+        room.effective_opening_area_height,
+        room.ventilation_system,
+        room.ventilation_working,
+        room.fan_background_distance_ok,
+        room.extract_rate_measured,
+        room.duct_diameter,
+        room.damp_mould_condensation,
+        room.door_undercut_value,
+        room.open_flue_heating_appliance
+      ].some((value) => value !== null && value !== undefined && String(value).trim() !== '');
+    }
+
     function parsePdf2(pdf) {
       const property = parsePropertyDetailsPdf2(pdf);
       const lines = pdf.pages.slice(4).flatMap((page) => page.lines.map((line) => line.trim()));
@@ -628,9 +691,13 @@
       }
       if (currentHeader) blocks.push({ header: currentHeader, lines: currentLines });
 
-      const rooms = blocks.map((block) => parseRoomBlock(block.header, block.lines));
+      const rooms = blocks
+        .map((block) => parseRoomBlock(block.header, block.lines))
+        .filter((room) => roomHasUsefulData(room));
+
       return { property, rooms };
     }
+
 
     function mergeData(pdf1Data, pdf2Data) {
       const mergedProperty = {
@@ -663,7 +730,17 @@
       function findPdf1Index(pdf2Room) {
         let index = pdf1Rooms.findIndex((room, i) => !usedPdf1Indexes.has(i) && room.match_key === pdf2Room.match_key);
         if (index >= 0) return index;
+
         index = pdf1Rooms.findIndex((room, i) => !usedPdf1Indexes.has(i) && room.base_match_key === pdf2Room.base_match_key);
+        if (index >= 0) return index;
+
+        const aliases = {
+          'living room': ['living room', 'lounge'],
+          hallway: ['hallway', 'hall', 'entrance hall'],
+          'laundry room': ['laundry room', 'utility']
+        };
+        const candidateKeys = aliases[pdf2Room.base_match_key] || [pdf2Room.base_match_key];
+        index = pdf1Rooms.findIndex((room, i) => !usedPdf1Indexes.has(i) && candidateKeys.includes(room.base_match_key));
         return index;
       }
 
