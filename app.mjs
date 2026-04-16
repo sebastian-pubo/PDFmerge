@@ -49,6 +49,18 @@ function titleCase(value) {
     .replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
+function slugifyRoomName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function roomKey(name, floor) {
+  return `${slugifyRoomName(name)}|${slugifyRoomName(floor)}`;
+}
+
 function escapeHtml(value) {
   return String(value || '')
     .replaceAll('&', '&amp;')
@@ -56,10 +68,6 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
-}
-
-function escapeRegExp(value) {
-  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function formatMultiline(value) {
@@ -219,60 +227,60 @@ function uniqueRoomLabel(baseName, index, totals) {
 
 function parseOpeningsFromLines(lines) {
   const openings = [];
+  let current = null;
+
+  function commitCurrent() {
+    if (!current) {
+      return;
+    }
+    openings.push({
+      index: current.index,
+      type: current.type,
+      width_m: current.width_m ?? null,
+      height_m: current.height_m ?? null,
+      distance_to_floor_m: current.distance_to_floor_m ?? null
+    });
+    current = null;
+  }
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = normalizeSpaces(lines[i]);
     const match = line.match(/^(\d+)\s+([A-Z][A-Z ]+)$/);
-    if (!match) {
+    if (match) {
+      commitCurrent();
+      current = {
+        index: Number(match[1]),
+        type: titleCase(normalizeSpaces(match[2]))
+      };
       continue;
     }
 
-    let dimensions = null;
-    let distance = null;
-    for (let j = i + 1; j < Math.min(i + 8, lines.length); j += 1) {
-      const candidate = normalizeSpaces(lines[j]);
-      if (!dimensions) {
-        const dimensionMatch = candidate.match(/([\d.]+)\s*m\s*x\s*([\d.]+)\s*m/i);
-        if (dimensionMatch) {
-          dimensions = {
-            width_m: Number(dimensionMatch[1]),
-            height_m: Number(dimensionMatch[2])
-          };
-        }
-      }
-
-      if (!distance) {
-        const distanceMatch = candidate.match(/([\d.]+)\s*m/i);
-        if (/Distance to Floor/i.test(normalizeSpaces(lines[j - 1] || '')) && distanceMatch) {
-          distance = Number(distanceMatch[1]);
-        }
-      }
+    if (!current) {
+      continue;
     }
 
-    openings.push({
-      index: Number(match[1]),
-      type: titleCase(normalizeSpaces(match[2])),
-      width_m: dimensions?.width_m ?? null,
-      height_m: dimensions?.height_m ?? null,
-      distance_to_floor_m: distance
-    });
+    const dimensionsMatch = line.match(/([\d.]+)\s*m\s*x\s*([\d.]+)\s*m/i);
+    if (dimensionsMatch) {
+      current.width_m = Number(dimensionsMatch[1]);
+      current.height_m = Number(dimensionsMatch[2]);
+    }
+
+    const distanceLineMatch = line.match(/([\d.]+)\s*m/i);
+    const priorLine = normalizeSpaces(lines[i - 1] || '');
+    if ((/Distance to Floor/i.test(priorLine) || /^Distance to Floor/i.test(line)) && distanceLineMatch) {
+      current.distance_to_floor_m = Number(distanceLineMatch[1]);
+    }
   }
 
+  commitCurrent();
   return openings;
 }
 
-function parseRoomBlock(roomMatch, detailsText, displayName) {
+function parseRoomDetailBlock(detailsText) {
   const detailLines = normalizeSpaces(detailsText).split('\n').map((line) => normalizeSpaces(line)).filter(Boolean);
   const normalizedDetails = normalizeSpaces(detailsText);
 
   return {
-    room_name: displayName,
-    floor: normalizeSpaces(roomMatch[2]),
-    width_m: Number(roomMatch[3]),
-    length_m: Number(roomMatch[4]),
-    ceiling_height_m: Number(roomMatch[5]),
-    area_m2: Number(roomMatch[6]),
-    perimeter_m: Number(roomMatch[7]),
     window_opening_area:
       extractWithRegex(normalizedDetails, /Window opening area[\s\S]*?\n([^\n]+)/i) ||
       findField(detailLines, 'Window opening area( WxH)'),
@@ -309,19 +317,7 @@ function looksLikeRoomHeader(lines, index) {
     return false;
   }
 
-  if (!/floor/i.test(next)) {
-    return false;
-  }
-
-  if (!/^WIDTH:/i.test(geometry)) {
-    return false;
-  }
-
-  if (!/^AREA:/i.test(areaLine)) {
-    return false;
-  }
-
-  return true;
+  return /floor/i.test(next) && /^WIDTH:/i.test(geometry) && /^AREA:/i.test(areaLine);
 }
 
 function extractRoomGeometry(line, areaLine) {
@@ -341,9 +337,48 @@ function extractRoomGeometry(line, areaLine) {
   };
 }
 
+function parseRoomDetails(pdf) {
+  const allLines = pdf.pages.flatMap((page) => page.lines.map((line) => normalizeSpaces(line)).filter(Boolean));
+  const detailsByRoom = new Map();
+
+  for (let i = 0; i < allLines.length; i += 1) {
+    const headerMatch = allLines[i].match(/^[^A-Za-z0-9]*([A-Za-z][A-Za-z0-9 &/'()-]+?)\s*\/\s*([A-Za-z ]+Floor)$/i);
+    if (!headerMatch) {
+      continue;
+    }
+
+    const name = normalizeSpaces(headerMatch[1]);
+    const floor = normalizeSpaces(headerMatch[2]);
+    const blockLines = [];
+    let j = i + 1;
+
+    while (j < allLines.length) {
+      const nextHeader = allLines[j].match(/^[^A-Za-z0-9]*([A-Za-z][A-Za-z0-9 &/'()-]+?)\s*\/\s*([A-Za-z ]+Floor)$/i);
+      if (nextHeader || looksLikeRoomHeader(allLines, j)) {
+        break;
+      }
+      blockLines.push(allLines[j]);
+      j += 1;
+    }
+
+    const key = roomKey(name, floor);
+    const existing = detailsByRoom.get(key) || [];
+    existing.push(blockLines.join('\n'));
+    detailsByRoom.set(key, existing);
+    i = j - 1;
+  }
+
+  const merged = new Map();
+  detailsByRoom.forEach((blocks, key) => {
+    merged.set(key, parseRoomDetailBlock(blocks.filter(Boolean).join('\n')));
+  });
+  return merged;
+}
+
 function parseRooms(pdf) {
   const totals = {};
   const rawRooms = [];
+  const detailsByRoom = parseRoomDetails(pdf);
 
   pdf.pages.forEach((page) => {
     const lines = page.lines.map((line) => normalizeSpaces(line)).filter(Boolean);
@@ -353,7 +388,7 @@ function parseRooms(pdf) {
         continue;
       }
 
-      const baseName = normalizeSpaces(lines[i].replace(/^▼\s*/, ''));
+      const baseName = normalizeSpaces(lines[i].replace(/^[^A-Za-z0-9]+/, ''));
       const floor = normalizeSpaces(lines[i + 1]);
       const geometry = extractRoomGeometry(lines[i + 2], lines[i + 3]);
       if (!geometry) {
@@ -370,36 +405,42 @@ function parseRooms(pdf) {
       rawRooms.push({
         base_name: baseName,
         floor,
-        detailsText: detailLines.join('\n'),
+        details_text: detailLines.join('\n'),
         ...geometry
       });
+
       i = j - 1;
     }
   });
 
   rawRooms.forEach((room) => {
-    const baseName = room.base_name;
-    totals[baseName] = (totals[baseName] || 0) + 1;
+    totals[room.base_name] = (totals[room.base_name] || 0) + 1;
   });
 
   const current = {};
 
   return rawRooms.map((room) => {
-    const baseName = room.base_name;
-    current[baseName] = (current[baseName] || 0) + 1;
-    const displayName = uniqueRoomLabel(baseName, current[baseName], totals);
-    const roomMatch = [
-      null,
-      room.base_name,
-      room.floor,
-      String(room.width_m),
-      String(room.length_m),
-      String(room.ceiling_height_m),
-      String(room.area_m2),
-      String(room.perimeter_m)
-    ];
+    current[room.base_name] = (current[room.base_name] || 0) + 1;
+    const displayName = uniqueRoomLabel(room.base_name, current[room.base_name], totals);
+    const inlineDetail = parseRoomDetailBlock(room.details_text);
+    const mergedDetail = detailsByRoom.get(roomKey(room.base_name, room.floor));
 
-    return parseRoomBlock(roomMatch, room.detailsText, displayName);
+    return {
+      room_name: displayName,
+      floor: room.floor,
+      width_m: room.width_m,
+      length_m: room.length_m,
+      ceiling_height_m: room.ceiling_height_m,
+      area_m2: room.area_m2,
+      perimeter_m: room.perimeter_m,
+      window_opening_area: mergedDetail?.window_opening_area || inlineDetail.window_opening_area,
+      trickle_vent_dimensions: mergedDetail?.trickle_vent_dimensions || inlineDetail.trickle_vent_dimensions,
+      window_opening_angle: mergedDetail?.window_opening_angle || inlineDetail.window_opening_angle,
+      fixed_ventilation: mergedDetail?.fixed_ventilation || inlineDetail.fixed_ventilation,
+      ceiling_distance_check: mergedDetail?.ceiling_distance_check || inlineDetail.ceiling_distance_check,
+      background_distance_check: mergedDetail?.background_distance_check || inlineDetail.background_distance_check,
+      openings: mergedDetail?.openings?.length ? mergedDetail.openings : inlineDetail.openings
+    };
   });
 }
 
@@ -455,8 +496,8 @@ function renderPreview(data) {
       ? room.openings.map((opening) => `
           <div class="opening">
             <strong>${escapeHtml(`${opening.index}. ${opening.type}`)}</strong><br>
-            ${escapeHtml(`${opening.width_m} m x ${opening.height_m} m`)}<br>
-            ${escapeHtml(`Distance to floor: ${opening.distance_to_floor_m} m`)}
+            ${escapeHtml(`${opening.width_m ?? '-'} m x ${opening.height_m ?? '-'} m`)}<br>
+            ${escapeHtml(`Distance to floor: ${opening.distance_to_floor_m ?? '-'} m`)}
           </div>
         `).join('')
       : '<div class="mini">No doors or windows were extracted for this room.</div>';
@@ -626,7 +667,7 @@ async function buildSummaryPdf(data) {
       room.openings.forEach((opening) => {
         labelValue(
           `${opening.index}. ${opening.type}`,
-          `${opening.width_m} m x ${opening.height_m} m, distance to floor ${opening.distance_to_floor_m} m`
+          `${opening.width_m ?? '-'} m x ${opening.height_m ?? '-'} m, distance to floor ${opening.distance_to_floor_m ?? '-'} m`
         );
       });
     }
