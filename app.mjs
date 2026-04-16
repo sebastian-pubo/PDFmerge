@@ -217,18 +217,44 @@ function uniqueRoomLabel(baseName, index, totals) {
   return totals[baseName] > 1 ? `${baseName} ${index}` : baseName;
 }
 
-function parseOpenings(detailsText) {
-  const openingRegex = /(\d+)\s+([A-Z][A-Z ]+)\nDimensions\n([\d.]+)\s*m\s*x\s*([\d.]+)\s*m\s*\(Width x Height\)\nDistance to Floor\n([\d.]+)\s*m/gi;
+function parseOpeningsFromLines(lines) {
   const openings = [];
-  let match;
 
-  while ((match = openingRegex.exec(detailsText)) !== null) {
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = normalizeSpaces(lines[i]);
+    const match = line.match(/^(\d+)\s+([A-Z][A-Z ]+)$/);
+    if (!match) {
+      continue;
+    }
+
+    let dimensions = null;
+    let distance = null;
+    for (let j = i + 1; j < Math.min(i + 8, lines.length); j += 1) {
+      const candidate = normalizeSpaces(lines[j]);
+      if (!dimensions) {
+        const dimensionMatch = candidate.match(/([\d.]+)\s*m\s*x\s*([\d.]+)\s*m/i);
+        if (dimensionMatch) {
+          dimensions = {
+            width_m: Number(dimensionMatch[1]),
+            height_m: Number(dimensionMatch[2])
+          };
+        }
+      }
+
+      if (!distance) {
+        const distanceMatch = candidate.match(/([\d.]+)\s*m/i);
+        if (/Distance to Floor/i.test(normalizeSpaces(lines[j - 1] || '')) && distanceMatch) {
+          distance = Number(distanceMatch[1]);
+        }
+      }
+    }
+
     openings.push({
       index: Number(match[1]),
       type: titleCase(normalizeSpaces(match[2])),
-      width_m: Number(match[3]),
-      height_m: Number(match[4]),
-      distance_to_floor_m: Number(match[5])
+      width_m: dimensions?.width_m ?? null,
+      height_m: dimensions?.height_m ?? null,
+      distance_to_floor_m: distance
     });
   }
 
@@ -269,31 +295,111 @@ function parseRoomBlock(roomMatch, detailsText, displayName) {
     background_distance_check:
       extractWithRegex(normalizedDetails, /Is the ventilation system further than 500mm away from background ventilation\?[\s\S]*?\n([^\n]+)/i) ||
       findField(detailLines, 'Is the ventilation system further than 500mm away from background ventilation? (If no system present please ignore)'),
-    openings: parseOpenings(detailsText)
+    openings: parseOpeningsFromLines(detailLines)
+  };
+}
+
+function looksLikeRoomHeader(lines, index) {
+  const line = normalizeSpaces(lines[index]);
+  const next = normalizeSpaces(lines[index + 1]);
+  const geometry = normalizeSpaces(lines[index + 2]);
+  const areaLine = normalizeSpaces(lines[index + 3]);
+
+  if (!line || !next || !geometry || !areaLine) {
+    return false;
+  }
+
+  if (!/floor/i.test(next)) {
+    return false;
+  }
+
+  if (!/^WIDTH:/i.test(geometry)) {
+    return false;
+  }
+
+  if (!/^AREA:/i.test(areaLine)) {
+    return false;
+  }
+
+  return true;
+}
+
+function extractRoomGeometry(line, areaLine) {
+  const geometryMatch = normalizeSpaces(line).match(/WIDTH:\s*([\d.]+)\s*m\s*[•·]?\s*LENGTH:\s*([\d.]+)\s*m\s*[•·]?\s*CEILING HEIGHT:\s*([\d.]+)\s*m/i);
+  const areaMatch = normalizeSpaces(areaLine).match(/AREA:\s*([\d.]+)\s*m(?:²|2)?\s*[•·]?\s*PERIMETER:\s*([\d.]+)\s*m/i);
+
+  if (!geometryMatch || !areaMatch) {
+    return null;
+  }
+
+  return {
+    width_m: Number(geometryMatch[1]),
+    length_m: Number(geometryMatch[2]),
+    ceiling_height_m: Number(geometryMatch[3]),
+    area_m2: Number(areaMatch[1]),
+    perimeter_m: Number(areaMatch[2])
   };
 }
 
 function parseRooms(pdf) {
-  const geometryPattern = /(?:^|\n)(?:▼\s*)?([A-Za-z][A-Za-z0-9 /&'()-]+?)\s*\n([A-Za-z ]+Floor)\s*\nWIDTH:\s*([\d.]+)\s*m\s*[•·]?\s*LENGTH:\s*([\d.]+)\s*m\s*[•·]?\s*CEILING HEIGHT:\s*([\d.]+)\s*m\s*\nAREA:\s*([\d.]+)\s*m(?:²|2)?\s*[•·]?\s*PERIMETER:\s*([\d.]+)\s*m/i;
-  const pageMatches = pdf.pages
-    .map((page) => ({ page, match: geometryPattern.exec(page.text) }))
-    .filter((entry) => entry.match);
   const totals = {};
+  const rawRooms = [];
 
-  pageMatches.forEach(({ match }) => {
-    const baseName = normalizeSpaces(match[1]);
+  pdf.pages.forEach((page) => {
+    const lines = page.lines.map((line) => normalizeSpaces(line)).filter(Boolean);
+
+    for (let i = 0; i < lines.length - 3; i += 1) {
+      if (!looksLikeRoomHeader(lines, i)) {
+        continue;
+      }
+
+      const baseName = normalizeSpaces(lines[i].replace(/^▼\s*/, ''));
+      const floor = normalizeSpaces(lines[i + 1]);
+      const geometry = extractRoomGeometry(lines[i + 2], lines[i + 3]);
+      if (!geometry) {
+        continue;
+      }
+
+      let j = i + 4;
+      const detailLines = [];
+      while (j < lines.length && !looksLikeRoomHeader(lines, j)) {
+        detailLines.push(lines[j]);
+        j += 1;
+      }
+
+      rawRooms.push({
+        base_name: baseName,
+        floor,
+        detailsText: detailLines.join('\n'),
+        ...geometry
+      });
+      i = j - 1;
+    }
+  });
+
+  rawRooms.forEach((room) => {
+    const baseName = room.base_name;
     totals[baseName] = (totals[baseName] || 0) + 1;
   });
 
   const current = {};
 
-  return pageMatches.map(({ page, match }) => {
-    const baseName = normalizeSpaces(match[1]);
+  return rawRooms.map((room) => {
+    const baseName = room.base_name;
     current[baseName] = (current[baseName] || 0) + 1;
     const displayName = uniqueRoomLabel(baseName, current[baseName], totals);
-    const detailsText = page.text.slice(match.index + match[0].length).trim();
+    const roomMatch = [
+      null,
+      room.base_name,
+      room.floor,
+      String(room.width_m),
+      String(room.length_m),
+      String(room.ceiling_height_m),
+      String(room.area_m2),
+      String(room.perimeter_m)
+    ];
 
-    return parseRoomBlock(match, detailsText, displayName);
+    return parseRoomBlock(roomMatch, room.detailsText, displayName);
   });
 }
 
