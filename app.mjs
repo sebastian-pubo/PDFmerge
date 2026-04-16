@@ -1,768 +1,561 @@
+import * as pdfjsLib from 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.mjs';
 
-    import * as pdfjsLib from 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.mjs';
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.mjs';
 
-    const statusEl = document.getElementById('status');
-    const processBtn = document.getElementById('processBtn');
-    const downloadPdfBtn = document.getElementById('downloadPdfBtn');
-    const downloadJsonBtn = document.getElementById('downloadJsonBtn');
-    const downloadPdf1JsonBtn = document.getElementById('downloadPdf1JsonBtn');
-    const pdf1Input = document.getElementById('pdf1');
-    const pdf2Input = document.getElementById('pdf2');
-    const propertyGrid = document.getElementById('propertyGrid');
-    const roomsWrap = document.getElementById('roomsWrap');
-    const preview = document.getElementById('preview');
-    const previewEmpty = document.getElementById('previewEmpty');
-    const matchSummary = document.getElementById('matchSummary');
-    const jsonPreview = document.getElementById('jsonPreview');
-    const reportTitleInput = document.getElementById('reportTitle');
-    const reportSubtitleInput = document.getElementById('reportSubtitle');
+const statusEl = document.getElementById('status');
+const processBtn = document.getElementById('processBtn');
+const downloadPdfBtn = document.getElementById('downloadPdfBtn');
+const downloadJsonBtn = document.getElementById('downloadJsonBtn');
+const sourcePdfInput = document.getElementById('sourcePdf');
+const propertyGrid = document.getElementById('propertyGrid');
+const roomsWrap = document.getElementById('roomsWrap');
+const preview = document.getElementById('preview');
+const previewEmpty = document.getElementById('previewEmpty');
+const jsonPreview = document.getElementById('jsonPreview');
+const reportTitleInput = document.getElementById('reportTitle');
+const reportSubtitleInput = document.getElementById('reportSubtitle');
 
-    let latestMerged = null;
-    let latestPdf1Parsed = null;
+let latestExtraction = null;
+let logoDataUrlPromise = null;
 
-    function setStatus(message, tone = 'info') {
-      statusEl.style.display = 'block';
-      statusEl.className = `status ${tone === 'error' ? 'error' : tone === 'warn' ? 'warn' : ''}`.trim();
-      statusEl.textContent = message;
+const PROPERTY_STOP_LABELS = ['CREATED ON', 'LOCATION', 'TOTAL AREA', 'FLOORS', 'ROOMS'];
+const CREATED_STOP_LABELS = ['LOCATION', 'TOTAL AREA', 'FLOORS', 'ROOMS'];
+const LOCATION_STOP_LABELS = ['TOTAL AREA', 'FLOORS', 'ROOMS'];
+const ROOMS_STOP_LABELS = ['WIDTH:', 'AREA:', 'THIS FLOOR PLAN'];
+
+function setStatus(message, tone = 'info') {
+  statusEl.style.display = 'block';
+  statusEl.className = `status ${tone === 'error' ? 'error' : tone === 'warn' ? 'warn' : ''}`.trim();
+  statusEl.textContent = message;
+}
+
+function clearStatus() {
+  statusEl.style.display = 'none';
+  statusEl.textContent = '';
+  statusEl.className = 'status';
+}
+
+function normalizeSpaces(value) {
+  return String(value || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function titleCase(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formatMultiline(value) {
+  return escapeHtml(String(value || '-')).replaceAll('\n', '<br>');
+}
+
+function isStopLine(line, stopLabels) {
+  const upper = normalizeSpaces(line).toUpperCase();
+  return stopLabels.some((label) => upper.startsWith(label));
+}
+
+function findLineIndex(lines, label) {
+  const target = label.toUpperCase();
+  return lines.findIndex((line) => normalizeSpaces(line).toUpperCase() === target);
+}
+
+function collectBlock(lines, label, stopLabels) {
+  const index = findLineIndex(lines, label);
+  if (index < 0) {
+    return null;
+  }
+
+  const values = [];
+  for (let i = index + 1; i < lines.length; i += 1) {
+    const line = normalizeSpaces(lines[i]);
+    if (!line) {
+      continue;
     }
-
-    function clearStatus() {
-      statusEl.style.display = 'none';
-      statusEl.textContent = '';
-      statusEl.className = 'status';
+    if (isStopLine(line, stopLabels)) {
+      break;
     }
+    values.push(line);
+  }
 
-    function normalizeSpaces(value) {
-      return String(value || '')
-        .replace(/\u00A0/g, ' ')
-        .replace(/[ \t]+/g, ' ')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
-    }
+  return values.length ? values.join('\n') : null;
+}
 
-    function slugifyRoomName(name) {
-      return String(name || '')
-        .toLowerCase()
-        .replace(/\(.*?\)/g, '')
-        .replace(/[^a-z0-9]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
+function findField(lines, labels) {
+  const variants = Array.isArray(labels) ? labels : [labels];
 
-    function titleCase(value) {
-      return String(value || '').toLowerCase().replace(/\b\w/g, (m) => m.toUpperCase());
-    }
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = normalizeSpaces(lines[i]);
 
-    function maybeNumber(value) {
-      const match = String(value || '').match(/-?\d+(?:\.\d+)?/);
-      return match ? Number(match[0]) : null;
-    }
-
-    function uniqueRoomLabel(baseName, index, totalForBase) {
-      return totalForBase > 1 ? `${baseName} ${index}` : baseName;
-    }
-
-    function asLineValue(lines, idx, label) {
-      const line = lines[idx] || '';
-      if (!line.startsWith(label)) return null;
-      const trailing = line.slice(label.length).trim();
-      if (trailing) return trailing;
-      for (let i = idx + 1; i < lines.length; i += 1) {
-        const candidate = (lines[i] || '').trim();
-        if (!candidate) continue;
-        if (/^Photo\b/i.test(candidate)) continue;
-        if (/^Please add location/i.test(candidate)) continue;
-        if (/^Input trickle vent/i.test(candidate)) continue;
-        return candidate;
-      }
-      return null;
-    }
-
-    function findField(lines, labels) {
-      const variants = Array.isArray(labels) ? labels : [labels];
-      for (let i = 0; i < lines.length; i += 1) {
-        const line = (lines[i] || '').trim();
-        for (const label of variants) {
-          if (Array.isArray(label)) {
-            const joined = label.map((_, offset) => (lines[i + offset] || '').trim()).join(' ');
-            const target = label.join(' ');
-            if (joined === target) {
-              return asLineValue(lines, i + label.length - 1, label[label.length - 1]);
-            }
-          } else if (line.startsWith(label)) {
-            return asLineValue(lines, i, label);
-          }
+    for (const label of variants) {
+      if (Array.isArray(label)) {
+        const joined = label.map((_, offset) => normalizeSpaces(lines[i + offset])).join(' ');
+        if (joined === label.join(' ')) {
+          return findNextValue(lines, i + label.length - 1, label[label.length - 1]);
         }
+      } else if (line.startsWith(label)) {
+        return findNextValue(lines, i, label);
       }
-      return null;
     }
+  }
 
-    function extractFieldByRegex(text, label, stopAtTwoNewlines = false) {
-      const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const pattern = stopAtTwoNewlines
-        ? new RegExp(`${escaped}\\n([\\s\\S]*?)(?=\\n\\n|$)`, 'i')
-        : new RegExp(`${escaped}\\n([^\\n]+)`, 'i');
-      const match = text.match(pattern);
-      return match ? normalizeSpaces(match[1]) : null;
+  return null;
+}
+
+function findNextValue(lines, index, label) {
+  const line = normalizeSpaces(lines[index]);
+  const trailing = line.slice(label.length).trim();
+  if (trailing) {
+    return trailing;
+  }
+
+  for (let i = index + 1; i < lines.length; i += 1) {
+    const candidate = normalizeSpaces(lines[i]);
+    if (!candidate) {
+      continue;
     }
-
-    async function readPdf(file) {
-      const buffer = await file.arrayBuffer();
-      const data = new Uint8Array(buffer);
-      const loadingTask = pdfjsLib.getDocument({ data });
-      const pdf = await loadingTask.promise;
-      const pages = [];
-
-      for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
-        const page = await pdf.getPage(pageNo);
-        const textContent = await page.getTextContent();
-        const rawItems = textContent.items
-          .filter((item) => item.str && item.str.trim())
-          .map((item) => ({
-            str: item.str.replace(/\s+/g, ' ').trim(),
-            x: item.transform[4],
-            y: item.transform[5]
-          }));
-
-        const rows = [];
-        rawItems.forEach((item) => {
-          let row = rows.find((existing) => Math.abs(existing.y - item.y) < 2.5);
-          if (!row) {
-            row = { y: item.y, items: [] };
-            rows.push(row);
-          }
-          row.items.push(item);
-        });
-
-        rows.sort((a, b) => b.y - a.y);
-        const lines = rows
-          .map((row) => row.items.sort((a, b) => a.x - b.x).map((item) => item.str).join(' ').replace(/\s+/g, ' ').trim())
-          .filter(Boolean);
-
-        const text = normalizeSpaces(lines.join('\n'));
-        pages.push({ pageNo, lines, text });
-      }
-
-      return {
-        name: file.name,
-        pages,
-        fullText: pages.map((p) => p.text).join('\n\n')
-      };
+    if (/^(PHOTO|PLEASE ADD LOCATION|INPUT TRICKLE VENT)/i.test(candidate)) {
+      continue;
     }
+    return candidate;
+  }
 
-    function parsePdf1(pdf) {
-      const property = {
-        source_file: pdf.name,
-        total_area_m2: null,
-        floors: null,
-        property_title: null
-      };
+  return null;
+}
 
-      property.property_title = normalizeSpaces((pdf.pages[0]?.lines?.[0]) || '') || null;
-      property.total_area_m2 = (pdf.fullText.match(/TOTAL AREA:\s*([\d.]+)\s*m²/i) || [null, null])[1] || null;
-      property.floors = (pdf.fullText.match(/FLOORS:\s*(\d+)/i) || [null, null])[1] || null;
+async function readPdf(file) {
+  const buffer = await file.arrayBuffer();
+  const data = new Uint8Array(buffer);
+  const loadingTask = pdfjsLib.getDocument({ data });
+  const pdf = await loadingTask.promise;
+  const pages = [];
 
-      const geometryPattern = /▼\s*([A-Za-z][A-Za-z ]+?)\s*\n([A-Za-z ]+Floor)\s*\nWIDTH:\s*([\d.]+)\s*m\s*[•·]\s*LENGTH:\s*([\d.]+)\s*m\s*[•·]\s*CEILING HEIGHT:\s*([\d.]+)\s*m\s*\nAREA:\s*([\d.]+)\s*m²\s*[•·]\s*PERIMETER:\s*([\d.]+)\s*m/gi;
-      const geometryMatches = [...pdf.fullText.matchAll(geometryPattern)];
-
-      const totalsByBase = {};
-      geometryMatches.forEach((match) => {
-        const base = normalizeSpaces(match[1]);
-        totalsByBase[base] = (totalsByBase[base] || 0) + 1;
-      });
-
-      const rooms = [];
-      const currentByBase = {};
-      geometryMatches.forEach((match) => {
-        const baseName = normalizeSpaces(match[1]);
-        currentByBase[baseName] = (currentByBase[baseName] || 0) + 1;
-        const displayName = uniqueRoomLabel(baseName, currentByBase[baseName], totalsByBase[baseName]);
-        rooms.push({
-          source: 'pdf1',
-          base_name: baseName,
-          room_name: displayName,
-          floor: normalizeSpaces(match[2]),
-          width_m: Number(match[3]),
-          length_m: Number(match[4]),
-          ceiling_height_m: Number(match[5]),
-          area_m2: Number(match[6]),
-          perimeter_m: Number(match[7]),
-          notes: null,
-          openings: [],
-          match_key: slugifyRoomName(displayName),
-          base_match_key: slugifyRoomName(baseName)
-        });
-      });
-
-      const detailHeaderPattern = /▼\s*([A-Za-z][A-Za-z ]+?)\s*\/\s*([A-Za-z ]+Floor)\s*\n/gi;
-      const detailHeaders = [...pdf.fullText.matchAll(detailHeaderPattern)];
-      const detailByRoom = {};
-      const detailCountByBase = {};
-
-      detailHeaders.forEach((headerMatch, idx) => {
-        const baseName = normalizeSpaces(headerMatch[1]);
-        detailCountByBase[baseName] = (detailCountByBase[baseName] || 0) + 1;
-        const roomLabel = uniqueRoomLabel(baseName, detailCountByBase[baseName], totalsByBase[baseName] || 1);
-        const start = headerMatch.index + headerMatch[0].length;
-        const end = idx + 1 < detailHeaders.length ? detailHeaders[idx + 1].index : pdf.fullText.length;
-        const block = pdf.fullText.slice(start, end);
-
-        const notesMatch = block.match(/(?:^|\n)Notes\n([\s\S]*?)(?=\n\d+\n[A-Z][A-Z ]+\nDimensions\b|\nTHIS FLOOR PLAN\b|$)/i);
-        const notes = notesMatch
-          ? normalizeSpaces(notesMatch[1].split('\n').filter(Boolean).join(' '))
-          : null;
-
-        const openings = [...block.matchAll(/(\d+)\n([A-Z][A-Z ]+)\nDimensions\n([\d.]+)\s*m\s*x\s*([\d.]+)\s*m\s*\(Width x Height\)\nDistance to Floor\n([\d.]+)\s*m/gi)]
-          .map((opening) => ({
-            index: Number(opening[1]),
-            type: titleCase(normalizeSpaces(opening[2])),
-            width_m: Number(opening[3]),
-            height_m: Number(opening[4]),
-            distance_to_floor_m: Number(opening[5])
-          }));
-
-        detailByRoom[roomLabel] = { notes, openings };
-      });
-
-      rooms.forEach((room) => {
-        const detail = detailByRoom[room.room_name];
-        if (detail) {
-          room.notes = detail.notes || room.notes;
-          room.openings = detail.openings || room.openings;
-        }
-      });
-
-      return { property, rooms };
-    }
-
-    function parsePropertyDetailsPdf2(pdf) {
-      const introText = pdf.pages.slice(0, 3).map((p) => p.text).join('\n\n');
-      return {
-        source_file: pdf.name,
-        property_address: extractFieldByRegex(introText, 'Property Address') || null,
-        postcode: extractFieldByRegex(introText, 'Postcode') || null,
-        assessor_name_id: extractFieldByRegex(introText, 'Assessor Name & ID') || null,
-        inspection_date: extractFieldByRegex(introText, 'Inspection Date') || null,
-        house_type: extractFieldByRegex(introText, 'House Type') || null,
-        classification_type: extractFieldByRegex(introText, 'Classification Type') || null,
-        orientation_front: extractFieldByRegex(introText, 'Orientation (front elevation)') || null,
-        orientation_degrees: extractFieldByRegex(introText, 'Orientation in degrees (front elevation)') || null,
-        exposure_zone: extractFieldByRegex(introText, 'Exposure Zone') || null,
-        main_wall_construction: extractFieldByRegex(introText, 'Main Wall Construction') || null,
-        cavity_wall_depth_mm: extractFieldByRegex(introText, 'Cavity wall depth (in mm)') || null,
-        insulation_present: extractFieldByRegex(introText, 'Is insulation present?') || null,
-        insulation_type: extractFieldByRegex(introText, 'Insulation type') || null,
-        floor_type: extractFieldByRegex(introText, 'Floor Type (Picture of airbricks if suspended timber is', true) || null,
-        material_type: extractFieldByRegex(introText, 'Material Type') || null
-      };
-    }
-
-    function isRoomHeader(line, nextLine = '') {
-      const trimmed = (line || '').trim();
-      const next = (nextLine || '').trim();
-      const match = trimmed.match(/^(Hallway|Living Room|Kitchen|Laundry Room|Bedroom(?:\s+\d+)?|Bathroom(?:\s+\d+)?)\s+\d+\s*\/\s*\d+/i);
-      if (!match) return false;
-      const base = match[1].toLowerCase();
-      if ((base === 'bedroom' || base === 'bathroom') && new RegExp(`^${match[1]}\\s+\\d+\\s+\\d+\\s*\\/\\s*\\d+`, 'i').test(next)) {
-        return false;
-      }
-      return true;
-    }
-
-    function cleanBlockLines(lines) {
-      return lines.map((line) => normalizeSpaces(line)).filter(Boolean);
-    }
-
-    function parseRoomBlock(header, blockLines) {
-      const cleanLines = cleanBlockLines(blockLines);
-      const roomName = normalizeSpaces(header.replace(/\s+\d+\s*\/\s*\d+.*$/, ''));
-      return {
-        source: 'pdf2',
-        room_name: roomName,
-        match_key: slugifyRoomName(roomName),
-        base_match_key: slugifyRoomName(roomName.replace(/\s+\d+$/, '')),
-        is_ensuite: findField(cleanLines, 'Is this an ensuite bathroom?'),
-        bedroom_type: findField(cleanLines, 'Double or Single Bedroom?'),
-        overall_condition: findField(cleanLines, 'Overall condition of the room'),
-        defects: findField(cleanLines, 'Does the room have any defects? (ie. moisture damage, cracking in walls, etc.)'),
-        has_windows: findField(cleanLines, 'Does the room have any windows?'),
-        window_condition: findField(cleanLines, 'Condition of the windows'),
-        has_trickle_vents: findField(cleanLines, 'Do the windows have trickle vents?'),
-        trickle_vent_size_mm2: findField(cleanLines, 'Size of the trickle vents mm2'),
-        windows_openable: findField(cleanLines, 'Are the windows openable?'),
-        opening_type: findField(cleanLines, 'Specify opening type'),
-        effective_opening_area_width: findField(cleanLines, 'Effective opening area width'),
-        effective_opening_area_height: findField(cleanLines, 'Effective opening area width height'),
-        ventilation_system: findField(cleanLines, 'Is there a ventilation system present in the room?'),
-        ventilation_working: findField(cleanLines, 'Is the ventilation system in good working order?'),
-        fan_background_distance_ok: findField(cleanLines, [['Are fans and background ventilators in the same room at', 'least 0.5m apart?'], 'Are fans and background ventilators in the same room at least 0.5m apart?']),
-        extract_rate_measured: findField(cleanLines, 'Extract ventilation rate measured (mandatory)'),
-        duct_diameter: findField(cleanLines, 'Duct diameter'),
-        damp_mould_condensation: findField(cleanLines, [['Are there any visible or reported signs of damp, mould or', 'excessive condensation within the room?'], 'Are there any visible or reported signs of damp, mould or excessive condensation within the room?']),
-        door_undercut_value: findField(cleanLines, 'Door undercut value (mandatory)'),
-        open_flue_heating_appliance: findField(cleanLines, 'Is there any open flue heating appliances within the room?')
-      };
-    }
-
-    function roomHasUsefulData(room) {
-      return [
-        room.is_ensuite,
-        room.bedroom_type,
-        room.overall_condition,
-        room.defects,
-        room.has_windows,
-        room.window_condition,
-        room.has_trickle_vents,
-        room.trickle_vent_size_mm2,
-        room.windows_openable,
-        room.opening_type,
-        room.effective_opening_area_width,
-        room.effective_opening_area_height,
-        room.ventilation_system,
-        room.ventilation_working,
-        room.fan_background_distance_ok,
-        room.extract_rate_measured,
-        room.duct_diameter,
-        room.damp_mould_condensation,
-        room.door_undercut_value,
-        room.open_flue_heating_appliance
-      ].some((value) => value !== null && value !== undefined && String(value).trim() !== '');
-    }
-
-    function parsePdf2(pdf) {
-      const property = parsePropertyDetailsPdf2(pdf);
-      const roomPages = pdf.pages.slice(5, 12);
-      const lines = roomPages.flatMap((page) => page.lines.map((line) => line.trim()));
-      const blocks = [];
-
-      let currentHeader = null;
-      let currentLines = [];
-      for (let i = 0; i < lines.length; i += 1) {
-        const line = lines[i];
-        const next = lines[i + 1] || '';
-        if (isRoomHeader(line, next)) {
-          if (currentHeader) blocks.push({ header: currentHeader, lines: currentLines });
-          currentHeader = line;
-          currentLines = [];
-          continue;
-        }
-        if (currentHeader) currentLines.push(line);
-      }
-      if (currentHeader) blocks.push({ header: currentHeader, lines: currentLines });
-
-      const rooms = blocks
-        .map((block) => parseRoomBlock(block.header, block.lines))
-        .filter((room) => roomHasUsefulData(room));
-
-      return { property, rooms };
-    }
-
-    function mergeData(pdf1Data, pdf2Data) {
-      const mergedProperty = {
-        property_address: pdf2Data.property.property_address || pdf1Data.property.property_title || null,
-        postcode: pdf2Data.property.postcode || null,
-        assessor_name_id: pdf2Data.property.assessor_name_id || null,
-        inspection_date: pdf2Data.property.inspection_date || null,
-        house_type: pdf2Data.property.house_type || null,
-        classification_type: pdf2Data.property.classification_type || null,
-        orientation_front: pdf2Data.property.orientation_front || null,
-        orientation_degrees: pdf2Data.property.orientation_degrees || null,
-        exposure_zone: pdf2Data.property.exposure_zone || null,
-        main_wall_construction: pdf2Data.property.main_wall_construction || null,
-        cavity_wall_depth_mm: pdf2Data.property.cavity_wall_depth_mm || null,
-        insulation_present: pdf2Data.property.insulation_present || null,
-        insulation_type: pdf2Data.property.insulation_type || null,
-        floor_type: pdf2Data.property.floor_type || null,
-        material_type: pdf2Data.property.material_type || null,
-        total_area_m2: pdf1Data.property.total_area_m2 || null,
-        floors: pdf1Data.property.floors || null,
-        source_pdf1: pdf1Data.property.source_file,
-        source_pdf2: pdf2Data.property.source_file
-      };
-
-      const pdf1Rooms = pdf1Data.rooms.map((room) => ({ ...room }));
-      const pdf2Rooms = pdf2Data.rooms.map((room) => ({ ...room }));
-      const unmatchedPdf2 = [];
-      const matchLog = [];
-      const usedPdf1Indexes = new Set();
-
-      function findPdf1Index(pdf2Room) {
-        let index = pdf1Rooms.findIndex((room, i) => !usedPdf1Indexes.has(i) && room.match_key === pdf2Room.match_key);
-        if (index >= 0) return index;
-
-        index = pdf1Rooms.findIndex((room, i) => !usedPdf1Indexes.has(i) && room.base_match_key === pdf2Room.base_match_key);
-        if (index >= 0) return index;
-
-        const aliases = {
-          'living room': ['living room', 'lounge'],
-          hallway: ['hallway', 'hall', 'entrance hall'],
-          'laundry room': ['laundry room', 'utility']
-        };
-        const candidateKeys = aliases[pdf2Room.base_match_key] || [pdf2Room.base_match_key];
-        index = pdf1Rooms.findIndex((room, i) => !usedPdf1Indexes.has(i) && candidateKeys.includes(room.base_match_key));
-        return index;
-      }
-
-      for (const room2 of pdf2Rooms) {
-        const idx = findPdf1Index(room2);
-        if (idx < 0) {
-          unmatchedPdf2.push(room2);
-          matchLog.push(`Unmatched PDF 2 room, appended after PDF 1 rooms: ${room2.room_name}`);
-          continue;
-        }
-        usedPdf1Indexes.add(idx);
-        const room1 = pdf1Rooms[idx];
-        matchLog.push(`Matched ${room2.room_name} -> ${room1.room_name} (${room1.floor})`);
-        room1.condition_data = { ...room2 };
-      }
-
-      const mergedRooms = pdf1Rooms.map((room) => ({
-        ...room,
-        condition_data: room.condition_data || null,
-        matched: Boolean(room.condition_data),
-        pdf2_only: false
+  for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
+    const page = await pdf.getPage(pageNo);
+    const textContent = await page.getTextContent();
+    const rawItems = textContent.items
+      .filter((item) => item.str && item.str.trim())
+      .map((item) => ({
+        str: item.str.replace(/\s+/g, ' ').trim(),
+        x: item.transform[4],
+        y: item.transform[5]
       }));
 
-      unmatchedPdf2.forEach((room2) => {
-        mergedRooms.push({
-          source: 'pdf2_only',
-          base_name: room2.room_name.replace(/\s+\d+$/, ''),
-          room_name: room2.room_name,
-          floor: null,
-          width_m: null,
-          length_m: null,
-          ceiling_height_m: null,
-          area_m2: null,
-          perimeter_m: null,
-          notes: null,
-          openings: [],
-          match_key: room2.match_key,
-          base_match_key: room2.base_match_key,
-          condition_data: { ...room2 },
-          matched: false,
-          pdf2_only: true
-        });
-      });
+    const rows = [];
+    rawItems.forEach((item) => {
+      let row = rows.find((existing) => Math.abs(existing.y - item.y) < 2.5);
+      if (!row) {
+        row = { y: item.y, items: [] };
+        rows.push(row);
+      }
+      row.items.push(item);
+    });
 
-      return {
-        property: mergedProperty,
-        rooms: mergedRooms,
-        unmatched_pdf2_rooms: unmatchedPdf2,
-        match_log: matchLog
+    rows.sort((a, b) => b.y - a.y);
+    const lines = rows
+      .map((row) => row.items.sort((a, b) => a.x - b.x).map((item) => item.str).join(' ').replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+
+    pages.push({
+      pageNo,
+      lines,
+      text: normalizeSpaces(lines.join('\n'))
+    });
+  }
+
+  return {
+    name: file.name,
+    pages,
+    fullText: pages.map((page) => page.text).join('\n\n')
+  };
+}
+
+function parseSummary(pdf) {
+  const firstPage = pdf.pages[0] || { lines: [], text: '' };
+  const lines = firstPage.lines.map((line) => normalizeSpaces(line));
+  const totalArea = findField(lines, 'Total area');
+  const floors = findField(lines, 'Floors');
+  const roomsSummary = collectBlock(lines, 'Rooms', ROOMS_STOP_LABELS);
+
+  return {
+    report_name: reportTitleInput.value.trim() || 'D1 Ventilation',
+    source_file: pdf.name,
+    submitted_by: collectBlock(lines, 'SUBMITTED BY', PROPERTY_STOP_LABELS),
+    created_on: collectBlock(lines, 'CREATED ON', CREATED_STOP_LABELS),
+    location: collectBlock(lines, 'LOCATION', LOCATION_STOP_LABELS),
+    total_area_m2: totalArea,
+    floors,
+    rooms_summary: roomsSummary
+  };
+}
+
+function uniqueRoomLabel(baseName, index, totals) {
+  return totals[baseName] > 1 ? `${baseName} ${index}` : baseName;
+}
+
+function parseOpenings(detailsText) {
+  const openingRegex = /(\d+)\s+([A-Z][A-Z ]+)\nDimensions\n([\d.]+)\s*m\s*x\s*([\d.]+)\s*m\s*\(Width x Height\)\nDistance to Floor\n([\d.]+)\s*m/gi;
+  const openings = [];
+  let match;
+
+  while ((match = openingRegex.exec(detailsText)) !== null) {
+    openings.push({
+      index: Number(match[1]),
+      type: titleCase(normalizeSpaces(match[2])),
+      width_m: Number(match[3]),
+      height_m: Number(match[4]),
+      distance_to_floor_m: Number(match[5])
+    });
+  }
+
+  return openings;
+}
+
+function parseRoomBlock(roomMatch, detailsText, displayName) {
+  const detailLines = normalizeSpaces(detailsText).split('\n').map((line) => normalizeSpaces(line)).filter(Boolean);
+
+  return {
+    room_name: displayName,
+    floor: normalizeSpaces(roomMatch[2]),
+    width_m: Number(roomMatch[3]),
+    length_m: Number(roomMatch[4]),
+    ceiling_height_m: Number(roomMatch[5]),
+    area_m2: Number(roomMatch[6]),
+    perimeter_m: Number(roomMatch[7]),
+    window_opening_area: findField(detailLines, 'Window opening area( WxH)'),
+    trickle_vent_dimensions: findField(detailLines, [
+      'Trickle vent dimensions (WxH).',
+      'Trickle vent dimensions (WxH). (if more than 1 window present please specify and identify accordingly within your',
+      ['Trickle vent dimensions (WxH). (if more than 1 window present please specify and identify accordingly within your', 'answer)']
+    ]),
+    window_opening_angle: findField(detailLines, 'Window opening angle'),
+    fixed_ventilation: findField(detailLines, 'Is there any fixed ventilation?'),
+    ceiling_distance_check: findField(detailLines, 'Is the ventilation system further than 400mm away from the ceiling? (If no system present please ignore)'),
+    background_distance_check: findField(detailLines, 'Is the ventilation system further than 500mm away from background ventilation? (If no system present please ignore)'),
+    openings: parseOpenings(detailsText)
+  };
+}
+
+function parseRooms(pdf) {
+  const geometryPattern = /▼\s*([A-Za-z][A-Za-z0-9 /&'-]+?)\s*\n([A-Za-z ]+Floor)\s*\nWIDTH:\s*([\d.]+)\s*m\s*[•·]\s*LENGTH:\s*([\d.]+)\s*m\s*[•·]\s*CEILING HEIGHT:\s*([\d.]+)\s*m\s*\nAREA:\s*([\d.]+)\s*m²\s*[•·]\s*PERIMETER:\s*([\d.]+)\s*m/gi;
+  const allMatches = [...pdf.fullText.matchAll(geometryPattern)];
+  const totals = {};
+
+  allMatches.forEach((match) => {
+    const baseName = normalizeSpaces(match[1]);
+    totals[baseName] = (totals[baseName] || 0) + 1;
+  });
+
+  const current = {};
+
+  return allMatches.map((match) => {
+    const baseName = normalizeSpaces(match[1]);
+    const floor = normalizeSpaces(match[2]);
+    current[baseName] = (current[baseName] || 0) + 1;
+    const displayName = uniqueRoomLabel(baseName, current[baseName], totals);
+    const detailHeader = new RegExp(`▼\\s*${escapeRegExp(baseName)}\\s*\\/\\s*${escapeRegExp(floor)}\\s*\\n([\\s\\S]*?)(?=\\n▼\\s*[A-Za-z]|$)`, 'i');
+    const detailMatch = pdf.fullText.match(detailHeader);
+    const detailsText = detailMatch ? detailMatch[1].trim() : '';
+
+    return parseRoomBlock(match, detailsText, displayName);
+  });
+}
+
+function extractReport(pdf) {
+  return {
+    summary: parseSummary(pdf),
+    rooms: parseRooms(pdf)
+  };
+}
+
+function renderPreview(data) {
+  preview.style.display = 'block';
+  previewEmpty.style.display = 'none';
+  propertyGrid.innerHTML = '';
+  roomsWrap.innerHTML = '';
+
+  const propertyOrder = [
+    ['Submitted by', data.summary.submitted_by],
+    ['Created on', data.summary.created_on],
+    ['Location', data.summary.location],
+    ['Total area', data.summary.total_area_m2 ? `${data.summary.total_area_m2} m²` : null],
+    ['Floors', data.summary.floors],
+    ['Rooms', data.summary.rooms_summary]
+  ];
+
+  propertyOrder.forEach(([key, value]) => {
+    const div = document.createElement('div');
+    div.className = 'kv';
+    div.innerHTML = `<div class="k">${escapeHtml(key)}</div><div class="v">${formatMultiline(value)}</div>`;
+    propertyGrid.appendChild(div);
+  });
+
+  data.rooms.forEach((room) => {
+    const card = document.createElement('div');
+    card.className = 'room-card';
+
+    const facts = [
+      ['Floor', room.floor],
+      ['Width', `${room.width_m} m`],
+      ['Length', `${room.length_m} m`],
+      ['Ceiling height', `${room.ceiling_height_m} m`],
+      ['Area', `${room.area_m2} m²`],
+      ['Perimeter', `${room.perimeter_m} m`],
+      ['Window opening area (W x H)', room.window_opening_area],
+      ['Trickle vent dimensions (W x H)', room.trickle_vent_dimensions],
+      ['Window opening angle', room.window_opening_angle],
+      ['Fixed ventilation', room.fixed_ventilation],
+      ['System 400 mm from ceiling', room.ceiling_distance_check],
+      ['System 500 mm from background vent', room.background_distance_check]
+    ];
+
+    const openingsHtml = room.openings.length
+      ? room.openings.map((opening) => `
+          <div class="opening">
+            <strong>${escapeHtml(`${opening.index}. ${opening.type}`)}</strong><br>
+            ${escapeHtml(`${opening.width_m} m x ${opening.height_m} m`)}<br>
+            ${escapeHtml(`Distance to floor: ${opening.distance_to_floor_m} m`)}
+          </div>
+        `).join('')
+      : '<div class="mini">No doors or windows were extracted for this room.</div>';
+
+    card.innerHTML = `
+      <div class="room-head">
+        <div>
+          <h3>${escapeHtml(room.room_name)}</h3>
+          <div class="sub">${escapeHtml(room.floor)}</div>
+        </div>
+      </div>
+      <div class="facts">
+        ${facts.map(([label, value]) => `<div class="fact"><b>${escapeHtml(label)}</b>${formatMultiline(value)}</div>`).join('')}
+      </div>
+      <div>
+        <div class="section-title section-subtitle">Doors and windows</div>
+        ${openingsHtml}
+      </div>
+    `;
+    roomsWrap.appendChild(card);
+  });
+
+  jsonPreview.textContent = JSON.stringify(data, null, 2);
+}
+
+function downloadBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function loadLogoDataUrl() {
+  if (!logoDataUrlPromise) {
+    logoDataUrlPromise = new Promise((resolve) => {
+      const image = new Image();
+      image.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext('2d');
+        if (!context) {
+          resolve(null);
+          return;
+        }
+        context.drawImage(image, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
       };
+      image.onerror = () => resolve(null);
+      image.src = './domna-logo.png';
+    });
+  }
+
+  return logoDataUrlPromise;
+}
+
+async function buildSummaryPdf(data) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const margin = 14;
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const contentWidth = pageWidth - margin * 2;
+  const logoDataUrl = await loadLogoDataUrl();
+  let y = margin;
+
+  function addPageIfNeeded(required = 14) {
+    if (y + required > pageHeight - margin) {
+      doc.addPage();
+      y = margin;
     }
+  }
 
-    function renderPreview(data) {
-      preview.style.display = 'block';
-      previewEmpty.style.display = 'none';
-      propertyGrid.innerHTML = '';
-      roomsWrap.innerHTML = '';
+  function textBlock(text, options = {}) {
+    const {
+      size = 10,
+      bold = false,
+      color = [32, 48, 73],
+      x = margin,
+      width = contentWidth,
+      gap = 1.6
+    } = options;
 
-      const propertyOrder = [
-        ['Property address', data.property.property_address],
-        ['Postcode', data.property.postcode],
-        ['Assessor', data.property.assessor_name_id],
-        ['Inspection date', data.property.inspection_date],
-        ['House type', data.property.house_type],
-        ['Classification', data.property.classification_type],
-        ['Orientation', data.property.orientation_front],
-        ['Orientation degrees', data.property.orientation_degrees],
-        ['Exposure zone', data.property.exposure_zone],
-        ['Main wall construction', data.property.main_wall_construction],
-        ['Cavity wall depth', data.property.cavity_wall_depth_mm],
-        ['Insulation present', data.property.insulation_present],
-        ['Insulation type', data.property.insulation_type],
-        ['Floor type', data.property.floor_type],
-        ['Material type', data.property.material_type],
-        ['Total area', data.property.total_area_m2 ? `${data.property.total_area_m2} m²` : null],
-        ['Floors', data.property.floors]
-      ];
+    doc.setFont('helvetica', bold ? 'bold' : 'normal');
+    doc.setFontSize(size);
+    doc.setTextColor(...color);
+    const lines = doc.splitTextToSize(String(text || '-'), width);
+    const height = lines.length * (size * 0.42 + gap) + 1.2;
+    addPageIfNeeded(height);
+    doc.text(lines, x, y);
+    y += height;
+  }
 
-      propertyOrder.forEach(([key, value]) => {
-        const div = document.createElement('div');
-        div.className = 'kv';
-        div.innerHTML = `<div class="k">${key}</div><div class="v">${value || '-'}</div>`;
-        propertyGrid.appendChild(div);
-      });
+  function labelValue(label, value) {
+    const labelWidth = 44;
+    addPageIfNeeded(8);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10);
+    doc.setTextColor(58, 74, 99);
+    doc.text(`${label}:`, margin, y);
+    doc.setFont('helvetica', 'normal');
+    const lines = doc.splitTextToSize(String(value || '-'), contentWidth - labelWidth);
+    doc.text(lines, margin + labelWidth, y);
+    y += lines.length * 4.6 + 1.2;
+  }
 
-      data.rooms.forEach((room) => {
-        const card = document.createElement('div');
-        card.className = 'room-card';
-        const openingsHtml = room.openings.length
-          ? room.openings.map((opening) => `
-              <div class="opening">
-                <strong>${opening.type}</strong><br>
-                ${opening.width_m} m x ${opening.height_m} m<br>
-                Distance to floor: ${opening.distance_to_floor_m} m
-              </div>
-            `).join('')
-          : '<div class="mini">No openings extracted.</div>';
+  function divider() {
+    addPageIfNeeded(5);
+    doc.setDrawColor(208, 216, 229);
+    doc.line(margin, y, pageWidth - margin, y);
+    y += 4;
+  }
 
-        const c = room.condition_data || {};
-        const facts = [
-          ['Floor', room.floor],
-          ['Width', room.width_m ? `${room.width_m} m` : null],
-          ['Length', room.length_m ? `${room.length_m} m` : null],
-          ['Ceiling height', room.ceiling_height_m ? `${room.ceiling_height_m} m` : null],
-          ['Area', room.area_m2 ? `${room.area_m2} m²` : null],
-          ['Perimeter', room.perimeter_m ? `${room.perimeter_m} m` : null],
-          ['Notes', room.notes],
-          ['Overall condition', c.overall_condition],
-          ['Defects', c.defects],
-          ['Has windows', c.has_windows],
-          ['Window condition', c.window_condition],
-          ['Trickle vents', c.has_trickle_vents],
-          ['Trickle vent size', c.trickle_vent_size_mm2],
-          ['Windows openable', c.windows_openable],
-          ['Ventilation system', c.ventilation_system],
-          ['Ventilation working', c.ventilation_working],
-          ['Extract rate', c.extract_rate_measured],
-          ['Duct diameter', c.duct_diameter],
-          ['Damp / mould / condensation', c.damp_mould_condensation],
-          ['Door undercut', c.door_undercut_value]
-        ];
+  doc.setFillColor(241, 246, 255);
+  doc.roundedRect(margin, y, contentWidth, 31, 4, 4, 'F');
+  if (logoDataUrl) {
+    doc.addImage(logoDataUrl, 'PNG', margin + 5, y + 5, 26, 12);
+  }
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(18);
+  doc.setTextColor(19, 54, 104);
+  doc.text(reportTitleInput.value.trim() || 'D1 Ventilation', margin + 36, y + 10);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(63, 78, 102);
+  const subtitle = reportSubtitleInput.value.trim() || 'Extracted from a single Domna ventilation report PDF';
+  doc.text(doc.splitTextToSize(subtitle, contentWidth - 42), margin + 36, y + 17);
+  y += 38;
 
-        const subText = room.pdf2_only
-          ? 'PDF 2 only room. Appended after PDF 1 rooms because no floor plan match was found.'
-          : room.matched
-            ? 'Matched with PDF 2 room data'
-            : 'PDF 1 room only. No PDF 2 room match found.';
+  textBlock('Property details', { size: 13, bold: true, color: [23, 39, 64] });
+  labelValue('Submitted by', data.summary.submitted_by);
+  labelValue('Created on', data.summary.created_on);
+  labelValue('Location', data.summary.location);
+  labelValue('Total area', data.summary.total_area_m2 ? `${data.summary.total_area_m2} m²` : null);
+  labelValue('Floors', data.summary.floors);
+  labelValue('Rooms', data.summary.rooms_summary);
 
-        card.innerHTML = `
-          <div class="room-head">
-            <div>
-              <h3>${room.room_name}</h3>
-              <div class="sub">${subText}</div>
-            </div>
-            <div class="sub">${room.floor || '-'}</div>
-          </div>
-          <div class="facts">
-            ${facts.map(([label, value]) => `<div class="fact"><b>${label}</b>${value || '-'}</div>`).join('')}
-          </div>
-          <div>
-            <div class="section-title" style="font-size:14px;margin-bottom:8px;">Openings</div>
-            ${openingsHtml}
-          </div>
-        `;
-        roomsWrap.appendChild(card);
-      });
+  divider();
+  textBlock('Room schedule', { size: 13, bold: true, color: [23, 39, 64] });
 
-      matchSummary.textContent = data.match_log.join('\n') + (data.unmatched_pdf2_rooms.length ? `\n\nPDF 2-only rooms appended at end:\n${data.unmatched_pdf2_rooms.map((room) => `- ${room.room_name}`).join('\n')}` : '');
-      jsonPreview.textContent = JSON.stringify(data, null, 2);
-    }
-
-    function downloadBlob(blob, fileName) {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    }
-
-    function buildSummaryPdf(data) {
-      const { jsPDF } = window.jspdf;
-      const doc = new jsPDF({ unit: 'mm', format: 'a4' });
-      const margin = 15;
-      const pageWidth = doc.internal.pageSize.getWidth();
-      const pageHeight = doc.internal.pageSize.getHeight();
-      const contentWidth = pageWidth - margin * 2;
-      let y = margin;
-
-      const title = reportTitleInput.value.trim() || 'Merged Property Room Summary';
-      const subtitle = reportSubtitleInput.value.trim() || '';
-
-      function addPageIfNeeded(required = 12) {
-        if (y + required > pageHeight - margin) {
-          doc.addPage();
-          y = margin;
-        }
-      }
-
-      function line(text, opts = {}) {
-        const { size = 10, bold = false, color = [31, 41, 55], indent = 0 } = opts;
-        doc.setFont('helvetica', bold ? 'bold' : 'normal');
-        doc.setFontSize(size);
-        doc.setTextColor(...color);
-        const lines = doc.splitTextToSize(text || '-', contentWidth - indent);
-        addPageIfNeeded(lines.length * (size * 0.45 + 1));
-        doc.text(lines, margin + indent, y);
-        y += lines.length * (size * 0.45 + 1) + 1.2;
-      }
-
-      function divider() {
-        addPageIfNeeded(4);
-        doc.setDrawColor(205, 213, 225);
-        doc.line(margin, y, pageWidth - margin, y);
-        y += 4;
-      }
-
-      function labelValue(label, value) {
-        const labelText = `${label}: `;
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(10);
-        doc.setTextColor(55, 65, 81);
-        const labelWidth = doc.getTextWidth(labelText);
-        const lines = doc.splitTextToSize(String(value || '-'), contentWidth - labelWidth);
-        addPageIfNeeded(lines.length * 5 + 2);
-        doc.text(labelText, margin, y);
-        doc.setFont('helvetica', 'normal');
-        doc.text(lines, margin + labelWidth, y);
-        y += lines.length * 5 + 1;
-      }
-
-      doc.setFillColor(234, 242, 255);
-      doc.roundedRect(margin, y, contentWidth, 24, 3, 3, 'F');
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(18);
-      doc.setTextColor(31, 79, 143);
-      doc.text(title, margin + 5, y + 8);
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(10);
-      doc.setTextColor(55, 65, 81);
-      const subtitleLines = doc.splitTextToSize(subtitle || 'Generated summary', contentWidth - 10);
-      doc.text(subtitleLines, margin + 5, y + 14);
-      y += 30;
-
-      line('Property details', { size: 14, bold: true, color: [17, 24, 39] });
-      [
-        ['Property address', data.property.property_address],
-        ['Postcode', data.property.postcode],
-        ['Assessor', data.property.assessor_name_id],
-        ['Inspection date', data.property.inspection_date],
-        ['House type', data.property.house_type],
-        ['Classification type', data.property.classification_type],
-        ['Orientation', data.property.orientation_front],
-        ['Orientation degrees', data.property.orientation_degrees],
-        ['Exposure zone', data.property.exposure_zone],
-        ['Main wall construction', data.property.main_wall_construction],
-        ['Cavity wall depth', data.property.cavity_wall_depth_mm],
-        ['Insulation present', data.property.insulation_present],
-        ['Insulation type', data.property.insulation_type],
-        ['Floor type', data.property.floor_type],
-        ['Material type', data.property.material_type],
-        ['Total area', data.property.total_area_m2 ? `${data.property.total_area_m2} m²` : null],
-        ['Floors', data.property.floors]
-      ].forEach(([label, value]) => labelValue(label, value));
-
+  data.rooms.forEach((room, index) => {
+    addPageIfNeeded(40);
+    if (index > 0) {
       divider();
-      line('Room summaries', { size: 14, bold: true, color: [17, 24, 39] });
-
-      data.rooms.forEach((room, idx) => {
-        addPageIfNeeded(25);
-        if (idx > 0) divider();
-        line(room.room_name, { size: 12, bold: true, color: [31, 79, 143] });
-        labelValue('Source', room.pdf2_only ? 'PDF 2 only room appended after PDF 1 list' : 'PDF 1 room baseline');
-        labelValue('Floor', room.floor);
-        labelValue('Width', room.width_m ? `${room.width_m} m` : null);
-        labelValue('Length', room.length_m ? `${room.length_m} m` : null);
-        labelValue('Ceiling height', room.ceiling_height_m ? `${room.ceiling_height_m} m` : null);
-        labelValue('Area', room.area_m2 ? `${room.area_m2} m²` : null);
-        labelValue('Perimeter', room.perimeter_m ? `${room.perimeter_m} m` : null);
-        labelValue('Notes', room.notes);
-
-        line('Openings', { size: 11, bold: true, color: [17, 24, 39] });
-        if (room.openings.length) {
-          room.openings.forEach((opening) => {
-            labelValue(opening.type, `${opening.width_m} m x ${opening.height_m} m; distance to floor ${opening.distance_to_floor_m} m`);
-          });
-        } else {
-          labelValue('Openings', 'None extracted');
-        }
-
-        const c = room.condition_data || {};
-        line('Condition and ventilation', { size: 11, bold: true, color: [17, 24, 39] });
-        [
-          ['Ensuite bathroom', c.is_ensuite],
-          ['Bedroom type', c.bedroom_type],
-          ['Overall condition', c.overall_condition],
-          ['Defects', c.defects],
-          ['Has windows', c.has_windows],
-          ['Window condition', c.window_condition],
-          ['Trickle vents', c.has_trickle_vents],
-          ['Trickle vent size', c.trickle_vent_size_mm2],
-          ['Windows openable', c.windows_openable],
-          ['Opening type', c.opening_type],
-          ['Effective opening area width', c.effective_opening_area_width],
-          ['Effective opening area height', c.effective_opening_area_height],
-          ['Ventilation system', c.ventilation_system],
-          ['Ventilation working', c.ventilation_working],
-          ['Fans and background vents 0.5 m apart', c.fan_background_distance_ok],
-          ['Extract rate measured', c.extract_rate_measured],
-          ['Duct diameter', c.duct_diameter],
-          ['Damp / mould / excessive condensation', c.damp_mould_condensation],
-          ['Door undercut', c.door_undercut_value],
-          ['Open flue heating appliance', c.open_flue_heating_appliance]
-        ].forEach(([label, value]) => {
-          if (value) labelValue(label, value);
-        });
-      });
-
-      return doc;
     }
 
-    processBtn.addEventListener('click', async () => {
-      clearStatus();
-      downloadPdfBtn.disabled = true;
-      downloadJsonBtn.disabled = true;
-      downloadPdf1JsonBtn.disabled = true;
-      latestMerged = null;
-      latestPdf1Parsed = null;
+    textBlock(room.room_name, { size: 12, bold: true, color: [19, 54, 104] });
+    textBlock(room.floor, { size: 10, color: [96, 112, 134] });
+    labelValue('Width', `${room.width_m} m`);
+    labelValue('Length', `${room.length_m} m`);
+    labelValue('Ceiling height', `${room.ceiling_height_m} m`);
+    labelValue('Area', `${room.area_m2} m²`);
+    labelValue('Perimeter', `${room.perimeter_m} m`);
+    labelValue('Window opening area', room.window_opening_area);
+    labelValue('Trickle vent dimensions', room.trickle_vent_dimensions);
+    labelValue('Window opening angle', room.window_opening_angle);
+    labelValue('Fixed ventilation', room.fixed_ventilation);
+    labelValue('System 400 mm from ceiling', room.ceiling_distance_check);
+    labelValue('System 500 mm from background vent', room.background_distance_check);
 
-      const file1 = pdf1Input.files?.[0];
-      const file2 = pdf2Input.files?.[0];
-      if (!file1 || !file2) {
-        setStatus('Please upload both PDFs before running the extraction.', 'warn');
-        return;
-      }
+    if (room.openings.length) {
+      textBlock('Doors and windows', { size: 11, bold: true, color: [23, 39, 64] });
+      room.openings.forEach((opening) => {
+        labelValue(
+          `${opening.index}. ${opening.type}`,
+          `${opening.width_m} m x ${opening.height_m} m, distance to floor ${opening.distance_to_floor_m} m`
+        );
+      });
+    }
+  });
 
-      processBtn.disabled = true;
-      setStatus('Reading PDFs and extracting text...');
+  return doc;
+}
 
-      try {
-        const [pdf1, pdf2] = await Promise.all([readPdf(file1), readPdf(file2)]);
-        setStatus('Parsing PDF 1 floor-plan rooms first, then merging PDF 2 room condition data...');
-        const pdf1Data = parsePdf1(pdf1);
-        const pdf2Data = parsePdf2(pdf2);
-        const merged = mergeData(pdf1Data, pdf2Data);
-        latestPdf1Parsed = pdf1Data;
-        latestMerged = merged;
-        renderPreview(merged);
+processBtn.addEventListener('click', async () => {
+  clearStatus();
+  downloadPdfBtn.disabled = true;
+  downloadJsonBtn.disabled = true;
+  latestExtraction = null;
 
-        const matchedCount = merged.rooms.filter((room) => room.matched).length;
-        const pdf1OnlyCount = merged.rooms.filter((room) => !room.pdf2_only).length;
-        const appendedCount = merged.rooms.filter((room) => room.pdf2_only).length;
-        setStatus(`Done. Extracted ${pdf1OnlyCount} PDF 1 rooms first, matched ${matchedCount}, and appended ${appendedCount} PDF 2-only rooms after the PDF 1 list. Review the preview, download the PDF 1 JSON to verify areas, then download the merged summary.`);
-        downloadPdfBtn.disabled = false;
-        downloadJsonBtn.disabled = false;
-        downloadPdf1JsonBtn.disabled = false;
-      } catch (error) {
-        console.error(error);
-        setStatus(`Extraction failed. ${error.message || error}`, 'error');
-      } finally {
-        processBtn.disabled = false;
-      }
-    });
+  const file = sourcePdfInput.files?.[0];
+  if (!file) {
+    setStatus('Please upload the report PDF before running the extraction.', 'warn');
+    return;
+  }
 
-    downloadPdfBtn.addEventListener('click', () => {
-      if (!latestMerged) return;
-      const doc = buildSummaryPdf(latestMerged);
-      const blob = doc.output('blob');
-      downloadBlob(blob, 'merged-property-room-summary.pdf');
-    });
+  processBtn.disabled = true;
+  setStatus('Reading the report PDF and extracting the first-page summary...');
 
-    downloadJsonBtn.addEventListener('click', () => {
-      if (!latestMerged) return;
-      const blob = new Blob([JSON.stringify(latestMerged, null, 2)], { type: 'application/json' });
-      downloadBlob(blob, 'merged-property-room-summary.json');
-    });
+  try {
+    const pdf = await readPdf(file);
+    setStatus('Extracting room measurements, ventilation answers, and openings from the same PDF...');
+    const extracted = extractReport(pdf);
+    latestExtraction = extracted;
+    renderPreview(extracted);
+    setStatus(`Done. Extracted ${extracted.rooms.length} room entries for ${extracted.summary.report_name}. Review the preview, then download the Domna PDF or the JSON snapshot.`);
+    downloadPdfBtn.disabled = false;
+    downloadJsonBtn.disabled = false;
+  } catch (error) {
+    console.error(error);
+    setStatus(`Extraction failed. ${error.message || error}`, 'error');
+  } finally {
+    processBtn.disabled = false;
+  }
+});
 
-    downloadPdf1JsonBtn.addEventListener('click', () => {
-      if (!latestPdf1Parsed) return;
-      const blob = new Blob([JSON.stringify(latestPdf1Parsed, null, 2)], { type: 'application/json' });
-      downloadBlob(blob, 'pdf1-floorplan-extracted.json');
-    });
-  
+downloadPdfBtn.addEventListener('click', async () => {
+  if (!latestExtraction) {
+    return;
+  }
+
+  const doc = await buildSummaryPdf(latestExtraction);
+  const blob = doc.output('blob');
+  downloadBlob(blob, 'D1-Ventilation.pdf');
+});
+
+downloadJsonBtn.addEventListener('click', () => {
+  if (!latestExtraction) {
+    return;
+  }
+
+  const blob = new Blob([JSON.stringify(latestExtraction, null, 2)], { type: 'application/json' });
+  downloadBlob(blob, 'D1-Ventilation.json');
+});
