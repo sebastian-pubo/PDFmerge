@@ -204,10 +204,12 @@ function parseSummary(pdf) {
   const lines = firstPage.lines.map((line) => normalizeSpaces(line));
   const firstPageText = normalizeSpaces(firstPage.text);
   const totalArea = extractWithRegex(firstPageText, /Total area(?:\s*m²)?[\s\S]{0,80}?(\d+(?:\.\d+)?)(?:\s*m²)?/i);
-  const floors = extractWithRegex(firstPageText, /Floors[\s\S]{0,30}?(\d+)/i);
+  const floors =
+    extractWithRegex(firstPageText, /Floors\s+(\d+)(?=\s+Rooms\b|$)/i) ||
+    extractWithRegex(firstPageText, /Floors[\s\S]{0,20}?(\d+)/i);
   const roomsSummary =
     collectBlock(lines, 'Rooms', ROOMS_STOP_LABELS) ||
-    extractWithRegex(firstPageText, /Rooms[\s\S]{0,120}?([A-Za-z][A-Za-z0-9 ]+\s+\d+(?:\s+\d+)*)/i);
+    extractWithRegex(firstPageText, /Rooms\s+(.+?)(?=\s+WIDTH:|$)/i);
 
   return {
     report_name: reportTitleInput.value.trim() || 'D1 Ventilation',
@@ -338,40 +340,32 @@ function extractRoomGeometry(line, areaLine) {
 }
 
 function parseRoomDetails(pdf) {
-  const allLines = pdf.pages.flatMap((page) => page.lines.map((line) => normalizeSpaces(line)).filter(Boolean));
+  const text = normalizeSpaces(pdf.fullText);
   const detailsByRoom = new Map();
+  const headerRegex = /(?:^|\n)\s*[▼]?\s*([A-Za-z][A-Za-z0-9 &/'()-]+?)\s*\/\s*([A-Za-z ]+Floor)\s*(?=\n|1\s+[A-Z]|Window opening area|Part F|$)/gim;
+  const headers = [...text.matchAll(headerRegex)];
 
-  for (let i = 0; i < allLines.length; i += 1) {
-    const headerMatch = allLines[i].match(/^[^A-Za-z0-9]*([A-Za-z][A-Za-z0-9 &/'()-]+?)\s*\/\s*([A-Za-z ]+Floor)$/i);
-    if (!headerMatch) {
-      continue;
-    }
-
-    const name = normalizeSpaces(headerMatch[1]);
-    const floor = normalizeSpaces(headerMatch[2]);
-    const blockLines = [];
-    let j = i + 1;
-
-    while (j < allLines.length) {
-      const nextHeader = allLines[j].match(/^[^A-Za-z0-9]*([A-Za-z][A-Za-z0-9 &/'()-]+?)\s*\/\s*([A-Za-z ]+Floor)$/i);
-      if (nextHeader || looksLikeRoomHeader(allLines, j)) {
-        break;
-      }
-      blockLines.push(allLines[j]);
-      j += 1;
+  headers.forEach((match, index) => {
+    const name = normalizeSpaces(match[1]);
+    const floor = normalizeSpaces(match[2]);
+    const start = (match.index ?? 0) + match[0].length;
+    const end = index + 1 < headers.length ? (headers[index + 1].index ?? text.length) : text.length;
+    const block = text.slice(start, end).trim();
+    if (!block) {
+      return;
     }
 
     const key = roomKey(name, floor);
     const existing = detailsByRoom.get(key) || [];
-    existing.push(blockLines.join('\n'));
+    existing.push(block);
     detailsByRoom.set(key, existing);
-    i = j - 1;
-  }
+  });
 
   const merged = new Map();
   detailsByRoom.forEach((blocks, key) => {
-    merged.set(key, parseRoomDetailBlock(blocks.filter(Boolean).join('\n')));
+    merged.set(key, parseRoomDetailBlock(blocks.join('\n')));
   });
+
   return merged;
 }
 
@@ -379,38 +373,26 @@ function parseRooms(pdf) {
   const totals = {};
   const rawRooms = [];
   const detailsByRoom = parseRoomDetails(pdf);
+  const geometryRegex = /(?:^|\n)\s*[▼]?\s*([A-Za-z][A-Za-z0-9 &/'()-]+?)\s*\n?\s*([A-Za-z ]+Floor)\s*\n?\s*WIDTH:\s*([\d.]+)\s*m\s*[•·]?\s*LENGTH:\s*([\d.]+)\s*m\s*[•·]?\s*CEILING HEIGHT:\s*([\d.]+)\s*m\s*\n?\s*AREA:\s*([\d.]+)\s*m(?:²|2)?\s*[•·]?\s*PERIMETER:\s*([\d.]+)\s*m/gim;
+  const geometryMatches = [...normalizeSpaces(pdf.fullText).matchAll(geometryRegex)];
 
-  pdf.pages.forEach((page) => {
-    const lines = page.lines.map((line) => normalizeSpaces(line)).filter(Boolean);
+  geometryMatches.forEach((match, index) => {
+    const baseName = normalizeSpaces(match[1]);
+    const floor = normalizeSpaces(match[2]);
+    const start = (match.index ?? 0) + match[0].length;
+    const end = index + 1 < geometryMatches.length ? (geometryMatches[index + 1].index ?? pdf.fullText.length) : pdf.fullText.length;
+    const detailsText = normalizeSpaces(pdf.fullText.slice(start, end));
 
-    for (let i = 0; i < lines.length - 3; i += 1) {
-      if (!looksLikeRoomHeader(lines, i)) {
-        continue;
-      }
-
-      const baseName = normalizeSpaces(lines[i].replace(/^[^A-Za-z0-9]+/, ''));
-      const floor = normalizeSpaces(lines[i + 1]);
-      const geometry = extractRoomGeometry(lines[i + 2], lines[i + 3]);
-      if (!geometry) {
-        continue;
-      }
-
-      let j = i + 4;
-      const detailLines = [];
-      while (j < lines.length && !looksLikeRoomHeader(lines, j)) {
-        detailLines.push(lines[j]);
-        j += 1;
-      }
-
-      rawRooms.push({
-        base_name: baseName,
-        floor,
-        details_text: detailLines.join('\n'),
-        ...geometry
-      });
-
-      i = j - 1;
-    }
+    rawRooms.push({
+      base_name: baseName,
+      floor,
+      details_text: detailsText,
+      width_m: Number(match[3]),
+      length_m: Number(match[4]),
+      ceiling_height_m: Number(match[5]),
+      area_m2: Number(match[6]),
+      perimeter_m: Number(match[7])
+    });
   });
 
   rawRooms.forEach((room) => {
