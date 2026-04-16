@@ -97,6 +97,11 @@ function collectBlock(lines, label, stopLabels) {
   return values.length ? values.join('\n') : null;
 }
 
+function extractWithRegex(text, regex) {
+  const match = normalizeSpaces(text).match(regex);
+  return match ? normalizeSpaces(match[1]) : null;
+}
+
 function findField(lines, labels) {
   const variants = Array.isArray(labels) ? labels : [labels];
 
@@ -189,9 +194,12 @@ async function readPdf(file) {
 function parseSummary(pdf) {
   const firstPage = pdf.pages[0] || { lines: [], text: '' };
   const lines = firstPage.lines.map((line) => normalizeSpaces(line));
-  const totalArea = findField(lines, 'Total area');
-  const floors = findField(lines, 'Floors');
-  const roomsSummary = collectBlock(lines, 'Rooms', ROOMS_STOP_LABELS);
+  const firstPageText = normalizeSpaces(firstPage.text);
+  const totalArea = extractWithRegex(firstPageText, /Total area(?:\s*m²)?[\s\S]{0,80}?(\d+(?:\.\d+)?)(?:\s*m²)?/i);
+  const floors = extractWithRegex(firstPageText, /Floors[\s\S]{0,30}?(\d+)/i);
+  const roomsSummary =
+    collectBlock(lines, 'Rooms', ROOMS_STOP_LABELS) ||
+    extractWithRegex(firstPageText, /Rooms[\s\S]{0,120}?([A-Za-z][A-Za-z0-9 ]+\s+\d+(?:\s+\d+)*)/i);
 
   return {
     report_name: reportTitleInput.value.trim() || 'D1 Ventilation',
@@ -229,6 +237,7 @@ function parseOpenings(detailsText) {
 
 function parseRoomBlock(roomMatch, detailsText, displayName) {
   const detailLines = normalizeSpaces(detailsText).split('\n').map((line) => normalizeSpaces(line)).filter(Boolean);
+  const normalizedDetails = normalizeSpaces(detailsText);
 
   return {
     room_name: displayName,
@@ -238,40 +247,51 @@ function parseRoomBlock(roomMatch, detailsText, displayName) {
     ceiling_height_m: Number(roomMatch[5]),
     area_m2: Number(roomMatch[6]),
     perimeter_m: Number(roomMatch[7]),
-    window_opening_area: findField(detailLines, 'Window opening area( WxH)'),
-    trickle_vent_dimensions: findField(detailLines, [
-      'Trickle vent dimensions (WxH).',
-      'Trickle vent dimensions (WxH). (if more than 1 window present please specify and identify accordingly within your',
-      ['Trickle vent dimensions (WxH). (if more than 1 window present please specify and identify accordingly within your', 'answer)']
-    ]),
-    window_opening_angle: findField(detailLines, 'Window opening angle'),
-    fixed_ventilation: findField(detailLines, 'Is there any fixed ventilation?'),
-    ceiling_distance_check: findField(detailLines, 'Is the ventilation system further than 400mm away from the ceiling? (If no system present please ignore)'),
-    background_distance_check: findField(detailLines, 'Is the ventilation system further than 500mm away from background ventilation? (If no system present please ignore)'),
+    window_opening_area:
+      extractWithRegex(normalizedDetails, /Window opening area[\s\S]*?\n([^\n]+)/i) ||
+      findField(detailLines, 'Window opening area( WxH)'),
+    trickle_vent_dimensions:
+      extractWithRegex(normalizedDetails, /Trickle vent dimensions[\s\S]*?\n([^\n]+)/i) ||
+      findField(detailLines, [
+        'Trickle vent dimensions (WxH).',
+        'Trickle vent dimensions (WxH). (if more than 1 window present please specify and identify accordingly within your',
+        ['Trickle vent dimensions (WxH). (if more than 1 window present please specify and identify accordingly within your', 'answer)']
+      ]),
+    window_opening_angle:
+      extractWithRegex(normalizedDetails, /Window opening angle\s*\n([^\n]+)/i) ||
+      findField(detailLines, 'Window opening angle'),
+    fixed_ventilation:
+      extractWithRegex(normalizedDetails, /Is there any fixed ventilation\?\s*\n([^\n]+)/i) ||
+      findField(detailLines, 'Is there any fixed ventilation?'),
+    ceiling_distance_check:
+      extractWithRegex(normalizedDetails, /Is the ventilation system further than 400mm away from the ceiling\?[\s\S]*?\n([^\n]+)/i) ||
+      findField(detailLines, 'Is the ventilation system further than 400mm away from the ceiling? (If no system present please ignore)'),
+    background_distance_check:
+      extractWithRegex(normalizedDetails, /Is the ventilation system further than 500mm away from background ventilation\?[\s\S]*?\n([^\n]+)/i) ||
+      findField(detailLines, 'Is the ventilation system further than 500mm away from background ventilation? (If no system present please ignore)'),
     openings: parseOpenings(detailsText)
   };
 }
 
 function parseRooms(pdf) {
-  const geometryPattern = /▼\s*([A-Za-z][A-Za-z0-9 /&'-]+?)\s*\n([A-Za-z ]+Floor)\s*\nWIDTH:\s*([\d.]+)\s*m\s*[•·]\s*LENGTH:\s*([\d.]+)\s*m\s*[•·]\s*CEILING HEIGHT:\s*([\d.]+)\s*m\s*\nAREA:\s*([\d.]+)\s*m²\s*[•·]\s*PERIMETER:\s*([\d.]+)\s*m/gi;
-  const allMatches = [...pdf.fullText.matchAll(geometryPattern)];
+  const geometryPattern = /(?:^|\n)(?:▼\s*)?([A-Za-z][A-Za-z0-9 /&'()-]+?)\s*\n([A-Za-z ]+Floor)\s*\nWIDTH:\s*([\d.]+)\s*m\s*[•·]?\s*LENGTH:\s*([\d.]+)\s*m\s*[•·]?\s*CEILING HEIGHT:\s*([\d.]+)\s*m\s*\nAREA:\s*([\d.]+)\s*m(?:²|2)?\s*[•·]?\s*PERIMETER:\s*([\d.]+)\s*m/i;
+  const pageMatches = pdf.pages
+    .map((page) => ({ page, match: geometryPattern.exec(page.text) }))
+    .filter((entry) => entry.match);
   const totals = {};
 
-  allMatches.forEach((match) => {
+  pageMatches.forEach(({ match }) => {
     const baseName = normalizeSpaces(match[1]);
     totals[baseName] = (totals[baseName] || 0) + 1;
   });
 
   const current = {};
 
-  return allMatches.map((match) => {
+  return pageMatches.map(({ page, match }) => {
     const baseName = normalizeSpaces(match[1]);
-    const floor = normalizeSpaces(match[2]);
     current[baseName] = (current[baseName] || 0) + 1;
     const displayName = uniqueRoomLabel(baseName, current[baseName], totals);
-    const detailHeader = new RegExp(`▼\\s*${escapeRegExp(baseName)}\\s*\\/\\s*${escapeRegExp(floor)}\\s*\\n([\\s\\S]*?)(?=\\n▼\\s*[A-Za-z]|$)`, 'i');
-    const detailMatch = pdf.fullText.match(detailHeader);
-    const detailsText = detailMatch ? detailMatch[1].trim() : '';
+    const detailsText = page.text.slice(match.index + match[0].length).trim();
 
     return parseRoomBlock(match, detailsText, displayName);
   });
