@@ -16,8 +16,8 @@ async function main() {
   const checks = [
     ['single PDF input present', html.includes('id="sourcePdf"')],
     ['D1 Ventilation title present', html.includes('D1 Ventilation')],
-    ['version 1.1.2 visible', html.includes('v1.1.2')],
-    ['app imported from index with cache busting', html.includes('src="./app.mjs?v=1.1.2"')],
+    ['version 1.1.3 visible', html.includes('v1.1.3')],
+    ['app imported from index with cache busting', html.includes('src="./app.mjs?v=1.1.3"')],
     ['single report extraction function present', app.includes('extractReport(pdf)')],
     ['Domna PDF filename present', app.includes("downloadBlob(blob, 'D1-Ventilation.pdf')")]
   ];
